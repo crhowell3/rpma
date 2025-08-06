@@ -8,15 +8,11 @@ use hkdf::{
     Hkdf,
     hmac::{Hmac, Mac},
 };
-use rand::{
-    SeedableRng, TryRngCore,
-    rngs::{OsRng, StdRng},
-};
+use rand::{RngCore, rngs::OsRng};
 use sha2::Sha256;
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
-// use hex_literal::hex;
 
 type AesCtr = Ctr128LE<Aes256>;
 
@@ -28,7 +24,7 @@ pub struct KeyPair {
 
 impl KeyPair {
     pub fn generate() -> Self {
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut rng = OsRng {};
         let secret = StaticSecret::random_from_rng(&mut rng);
         let public = PublicKey::from(&secret);
         Self { secret, public }
@@ -53,7 +49,7 @@ pub fn init_remote_key(id: &[u8], shared_key: [u8; 32], remote_key: [u8; 32]) ->
 
 pub fn random_id() -> [u8; 16] {
     let mut id = [0u8; 16];
-    OsRng.try_fill_bytes(&mut id);
+    OsRng.fill_bytes(&mut id);
     id
 }
 
