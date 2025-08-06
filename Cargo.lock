@@ -606,11 +606,13 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "anyhow",
+ "bytes",
  "clap",
  "ctr",
  "env_logger",
  "hex",
  "hkdf",
+ "libc",
  "log",
  "rand",
  "sha2",

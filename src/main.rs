@@ -1,12 +1,17 @@
+use bytes::BytesMut;
 use clap::Parser;
 use encryption::Session;
+use kademlia::{ID, RoutingTable};
 use log::{debug, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::{io, thread};
 use tokio::task;
 
 mod encryption;
+mod kademlia;
+mod net;
 
 use crate::encryption::KeyPair;
 

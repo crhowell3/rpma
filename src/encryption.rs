@@ -400,7 +400,7 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(id: &[u8], shared_key: [u8; 32], keys: KeyPair) -> Self {
+    pub fn new(id: &[u8], shared_key: [u8; 32], keys: KeyPair) -> Self {
         Self {
             id: id.to_vec(),
             state: State::new(shared_key, keys),
