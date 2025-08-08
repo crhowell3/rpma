@@ -43,8 +43,8 @@ impl From<u8> for Tag {
 }
 
 pub struct Packet {
-    op: Op,
-    tag: Tag,
+    pub op: Op,
+    pub tag: Tag,
 }
 
 impl Packet {

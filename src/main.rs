@@ -3,10 +3,13 @@ use clap::Parser;
 use encryption::Session;
 use kademlia::{ID, RoutingTable};
 use log::{debug, warn};
+use net::packet::{Op, Packet, Tag};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
 use std::{io, thread};
+use tokio::net::TcpStream;
 use tokio::task;
 
 mod encryption;
@@ -27,8 +30,8 @@ async fn main() -> anyhow::Result<()> {
     let mut node = Node::new(keys, listen_addr)?;
     node.bind().await?;
 
-    debug!("public key: {}", hex::encode(&node.keys.public_key));
-    debug!("secret key: {}", hex::encode(&node.keys.secret_key[..32]));
+    debug!("public key: {}", hex::encode(&node.keys.public));
+    debug!("secret key: {}", hex::encode(&node.keys.secret[..32]));
     debug!("peer id: {}", node.id());
 
     let node = Arc::new(node);
@@ -69,7 +72,7 @@ fn bootstrap_node_with_peer(node: Node, client: Client) {}
 
 struct Node {
     id: ID,
-    socket: TcpListener,
+    socket: Option<TcpListener>,
     address: SocketAddr,
     keys: KeyPair,
     table: RoutingTable,
@@ -79,36 +82,112 @@ struct Node {
 
 impl Node {
     pub fn new(keys: KeyPair, address: SocketAddr) -> io::Result<Self> {
-        let socket = TcpListener::bind(address)?;
-        let local_addr = socket.local_addr()?;
-        let id = ID::new(keys.public_key.to_bytes(), local_addr);
+        let id = ID::new(keys.public.to_bytes(), address);
 
         Ok(Self {
             id,
-            socket,
-            address: local_addr,
+            socket: None,
+            address,
             keys,
-            table: RoutingTable::new(keys.public_key.to_bytes()),
+            table: RoutingTable::new(keys.public.to_bytes()),
             clients: HashMap::new(),
             processed_nonces: HashSet::new(),
         })
     }
 
-    pub fn run_accept_loop(self: Arc<Mutex<Self>>) -> io::Result<()> {
-        let socket = self.lock().unwrap().socket.try_clone()?;
-        for stream in socket.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let node_clone = Arc::clone(&self);
-                    thread::spawn(move || {
-                        if let Err(err) = Node::handle_client(node_clone, stream) {
-                            eprintln!("Client handler error: {err}");
-                        }
-                    });
+    pub async fn bind(&mut self) -> std::io::Result<()> {
+        let listener = TcpListener::bind(self.address).await?;
+        let local_addr = listener.local_addr()?;
+        self.address = local_addr;
+        self.id.address = local_addr;
+        self.socket = Some(listener);
+        Ok(())
+    }
+
+    pub async fn run_accept_loop(self: Arc<Mutex<Self>>) -> std::io::Result<()> {
+        let listener = {
+            let node = self.lock().unwrap();
+            node.socket.as_ref().unwrap().try_clone()?
+        };
+
+        loop {
+            let (stream, addr) = listener.accept()?;
+            let node_clone = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = node_clone.handle_client(stream, addr).await {
+                    eprintln!("Error handling client {}: {:?}", addr, e);
                 }
-                Err(e) => {}
+            });
+        }
+    }
+
+    async fn handle_client(
+        self: Arc<Mutex<Self>>,
+        mut stream: TcpStream,
+        address: SocketAddr,
+    ) -> std::io::Result<()> {
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+
+            let packet = Packet::read(&buf[..n])?;
+            self.process_packet(packet, addr, &mut stream).await?;
+        }
+        Ok(())
+    }
+
+    async fn process_packet(
+        &self,
+        packet: Packet,
+        addr: SocketAddr,
+        stream: &mut TcpStream,
+    ) -> std::io::Result<()> {
+        match packet.op {
+            Op::Request => match packet.tag {
+                Tag::Hello => {
+                    // NOOP
+                }
+                Tag::FindNodes => {
+                    // NOOP
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Unexpected tag",
+                    ));
+                }
+            },
+
+            Op::Command => {
+                match packet.tag {
+                    Tag::Route => {
+                        // NOOP
+                    }
+                    Tag::Echo => {
+                        // NOOP
+                    }
+                    Tag::Broadcast => {
+                        // NOOP
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Unexpected tag",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Unexpected op",
+                ));
             }
         }
+        Ok(())
     }
 }
 
@@ -119,7 +198,7 @@ struct Client {
     peer_id: Option<ID>,
     keys: KeyPair,
     read_task: Option<tokio::task::JoinHandle<Result<Vec<u8>, anyhow::Error>>>,
-    can_read: tokio::sync::Notify,
+    can_read: Arc<tokio::sync::Notify>,
 }
 
 impl Client {
@@ -131,11 +210,11 @@ impl Client {
         Ok(Client {
             socket,
             address,
-            conn: Connection::new(socket.clone(), node_keys),
+            conn: Connection::new(socket.try_clone(), node_keys),
             peer_id: None,
             keys: KeyPair::generate(),
             read_task: None,
-            can_read: tokio::sync::Notify::new(),
+            can_read: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -172,9 +251,11 @@ impl Client {
         self.peer_id = Some(peer_id);
 
         let session = match key_type {
-            KeyType::KeyPair => {
-                Session::new(encryption::random_id(), shared_secret.as_bytes(), self.keys)
-            }
+            KeyType::KeyPair => Session::new(
+                &encryption::random_id(),
+                shared_secret.as_bytes(),
+                self.keys,
+            ),
             KeyType::RemoteKey => Session::new_remote(
                 encryption::random_id(),
                 shared_secret.as_bytes(),
@@ -196,6 +277,11 @@ pub enum KeyType {
 
 const FLAG_SIGNED: u8 = 0x1;
 const FLAG_ENCRYPTED: u8 = 0x2;
+
+pub enum Backend {
+    Socket(TcpStream),
+    Connection(Box<Connection>),
+}
 
 struct Connection {
     pub write_buffer: BytesMut,
@@ -291,7 +377,7 @@ impl Connection {
 
 pub struct SigningWriter<W: Write> {
     inner: W,
-    signer: X25519_dalek::SignerMut<'static>,
+    signer: SignerMut<'static>,
     buffer: Vec<u8>,
 }
 
