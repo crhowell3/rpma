@@ -1,14 +1,14 @@
 use aes::{
-    Aes256,
     cipher::{KeyIvInit, StreamCipher},
+    Aes256,
 };
 use anyhow::Result;
 use ctr::Ctr128LE;
 use hkdf::{
-    Hkdf,
     hmac::{Hmac, Mac},
+    Hkdf,
 };
-use rand::{RngCore, rngs::OsRng};
+use rand::{rngs::OsRng, RngCore};
 use sha2::Sha256;
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
@@ -387,7 +387,7 @@ impl Header {
     }
 }
 
-struct Encrypted {
+pub struct Encrypted {
     dh: [u8; 32],
     n: u32,
     pn: u32,

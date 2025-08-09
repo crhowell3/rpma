@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::{AddAssign, SubAssign};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ID {
     pub public_key: [u8; 32],
     pub address: SocketAddr,
@@ -299,6 +299,7 @@ impl RoutingTable {
     }
 }
 
+#[derive(Debug)]
 pub struct StaticRingBuffer<T, Counter, const CAPACITY: usize>
 where
     Counter: Copy + Default + PartialOrd + AddAssign<u64> + SubAssign<u64> + From<u8> + Into<u64>,

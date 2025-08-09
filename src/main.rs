@@ -1,16 +1,20 @@
-use bytes::BytesMut;
+use anyhow::bail;
+use blake3::Hasher;
+use bytes::{BufMut, BytesMut};
 use clap::Parser;
+use ed25519_dalek::{Signature, SigningKey};
 use encryption::Session;
 use kademlia::{ID, RoutingTable};
 use log::{debug, warn};
-use net::packet::{Op, Packet, Tag};
+use net::packet::{EncryptionMetadata, Op, Packet, PacketHeader, Tag};
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use std::{io, thread};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio::task;
 
 mod encryption;
 mod kademlia;
@@ -30,9 +34,12 @@ async fn main() -> anyhow::Result<()> {
     let mut node = Node::new(keys, listen_addr)?;
     node.bind().await?;
 
-    debug!("public key: {}", hex::encode(&node.keys.public));
-    debug!("secret key: {}", hex::encode(&node.keys.secret[..32]));
-    debug!("peer id: {}", node.id());
+    debug!("public key: {}", hex::encode(&node.keys.public.to_bytes()));
+    debug!(
+        "secret key: {}",
+        hex::encode(&node.keys.secret.to_bytes()[..32])
+    );
+    debug!("peer id: {}", node.id);
 
     let node = Arc::new(node);
     let accept_node = Arc::clone(&node);
@@ -45,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     if options.interactive {
         let interactive_mode = Arc::clone(&node);
         std::thread::spawn(move || {
-            if let Err(e) = open_tty(interactive_mode) {
+            if let Err(e) = open_tty(*interactive_mode.deref()) {
                 eprintln!("TTY error: {:?}", e);
             }
         });
@@ -53,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
 
     for bootstrap_addr in &options.bootstrap_nodes {
         match bootstrap_addr.parse::<SocketAddr>() {
-            Ok(addr) => match node.get_or_create_client(addr).await {
+            Ok(addr) => match node.deref().get_or_create_client(addr).await {
                 Ok(_client) => {}
                 Err(e) => {
                     warn!("Could not connect to bootstrap node {}: {}", addr, e);
@@ -68,11 +75,58 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn bootstrap_node_with_peer(node: Node, client: Client) {}
+fn bootstrap_node_with_peer(node: &mut Node, client: &mut Client) -> anyhow::Result<()> {
+    debug!("bootstrapping with node {}", client.peer_id);
+
+    client.acquire_reader();
+
+    Packet {
+        op: Op::Request,
+        tag: Tag::FindNodes,
+    }
+    .write(&mut client.writer())?;
+
+    FindNodeFrameRequest {
+        public_key: node.id.public_key,
+    }
+    .write(&mut client.writer())?;
+
+    client.flush();
+
+    let raw_frame = Node::read_frame(client)?;
+
+    let mut cursor = std::io::Cursor::new(raw_frame);
+    let packet = Packet::read(&mut cursor)?;
+    if packet.op != Op::Response {
+        bail!("UnexpectedOp");
+    }
+    if packet.tag != Tag::FindNodes {
+        bail!("UnexpectedTag");
+    }
+
+    let frame = FindNodeFrameResponse::read(&mut cursor)?;
+
+    for peer_id in frame.peer_ids {
+        if let Err(err) = node.get_or_create_client(peer_id.address) {
+            warn!("could not connect to peer {}: {}", peer_id, err);
+            continue;
+        }
+    }
+
+    Ok(())
+}
+
+fn open_tty(node: Node) -> std::io::Result<()> {
+    let buffer = [0u8; 1024];
+
+    loop {
+        let command;
+    }
+}
 
 struct Node {
     id: ID,
-    socket: Option<TcpListener>,
+    socket: Option<TcpStream>,
     address: SocketAddr,
     keys: KeyPair,
     table: RoutingTable,
@@ -96,17 +150,17 @@ impl Node {
     }
 
     pub async fn bind(&mut self) -> std::io::Result<()> {
-        let listener = TcpListener::bind(self.address).await?;
-        let local_addr = listener.local_addr()?;
+        let listener = tokio::net::TcpListener::bind(self.address);
+        let local_addr = listener.await?.local_addr().unwrap();
         self.address = local_addr;
         self.id.address = local_addr;
         self.socket = Some(listener);
         Ok(())
     }
 
-    pub async fn run_accept_loop(self: Arc<Mutex<Self>>) -> std::io::Result<()> {
+    pub async fn run_accept_loop(self: Arc<Self>) -> std::io::Result<()> {
         let listener = {
-            let node = self.lock().unwrap();
+            let node = self.deref();
             node.socket.as_ref().unwrap().try_clone()?
         };
 
@@ -122,7 +176,7 @@ impl Node {
     }
 
     async fn handle_client(
-        self: Arc<Mutex<Self>>,
+        self: Arc<Self>,
         mut stream: TcpStream,
         address: SocketAddr,
     ) -> std::io::Result<()> {
@@ -133,8 +187,10 @@ impl Node {
                 break;
             }
 
-            let packet = Packet::read(&buf[..n])?;
-            self.process_packet(packet, addr, &mut stream).await?;
+            let packet = Packet::read(&mut &buf[..n])?;
+            self.deref()
+                .process_packet(packet, address, &mut stream)
+                .await?;
         }
         Ok(())
     }
@@ -192,7 +248,7 @@ impl Node {
 }
 
 struct Client {
-    socket: TcpListener,
+    socket: TcpStream,
     address: SocketAddr,
     conn: Connection,
     peer_id: Option<ID>,
@@ -203,14 +259,14 @@ struct Client {
 
 impl Client {
     pub async fn new(
-        socket: TcpListener,
+        socket: TcpStream,
         address: SocketAddr,
         node_keys: KeyPair,
     ) -> anyhow::Result<Self> {
         Ok(Client {
             socket,
             address,
-            conn: Connection::new(socket.try_clone(), node_keys),
+            conn: Connection::new(socket, node_keys),
             peer_id: None,
             keys: KeyPair::generate(),
             read_task: None,
@@ -218,7 +274,7 @@ impl Client {
         })
     }
 
-    pub fn writer(&mut self) -> Writer {
+    pub fn writer(&mut self) -> &mut BytesMut {
         self.conn.writer()
     }
 
@@ -241,10 +297,10 @@ impl Client {
         nonce: [u8; 32],
         key_type: KeyType,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let shared = self.keys.secret;
+        let shared = self.keys.secret.as_bytes();
 
         let mut hasher = Hasher::new();
-        hasher.update(&shared);
+        hasher.update(shared);
         hasher.update(&nonce);
         let shared_secret = hasher.finalize();
 
@@ -253,18 +309,18 @@ impl Client {
         let session = match key_type {
             KeyType::KeyPair => Session::new(
                 &encryption::random_id(),
-                shared_secret.as_bytes(),
+                *shared_secret.as_bytes(),
                 self.keys,
             ),
-            KeyType::RemoteKey => Session::new_remote(
-                encryption::random_id(),
-                shared_secret.as_bytes(),
-                public_key,
+            KeyType::RemoteKey => Session::new(
+                &encryption::random_id(),
+                *shared_secret.as_bytes(),
+                self.keys,
             ),
         };
 
         self.conn.session = Some(session);
-        self.conn.flags |= FLAG_SIGNED |= FLAG_ENCRYPTED;
+        self.conn.flags |= FLAG_SIGNED | FLAG_ENCRYPTED;
 
         Ok(())
     }
@@ -344,7 +400,7 @@ impl Connection {
 
         PacketHeader {
             flags: self.flags,
-            len: packet_len as u16,
+            len: packet_len as u32,
         }
         .write(&mut output)?;
 
@@ -392,7 +448,7 @@ impl<W: Write> SigningWriter<W> {
 
     pub fn sign(mut self) -> io::Result<()> {
         let sign: Signature = self.signer.sign(&self.buffer);
-        self.inner.write_all(sig.as_ref())
+        self.inner.write_all(sign.as_ref())
     }
 
     pub fn into_inner(self) -> W {

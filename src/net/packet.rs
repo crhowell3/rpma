@@ -1,6 +1,6 @@
 use std::io::{Read, Result, Write};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Request,
     Response,
@@ -18,7 +18,7 @@ impl From<u8> for Op {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tag {
     Ping,
     Hello,
@@ -68,8 +68,8 @@ impl Packet {
 }
 
 pub struct PacketHeader {
-    len: u32,
-    flags: u8,
+    pub len: u32,
+    pub flags: u8,
 }
 
 impl PacketHeader {
@@ -81,7 +81,17 @@ impl PacketHeader {
         Ok(())
     }
 
-    pub fn read<R: Read>(raeder: &mut R) -> Result<Self> {}
+    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
+        let mut len_buf = [0u8; 4];
+        let mut flags_buf = [0u8; 1];
+        reader.read_exact(&mut len_buf)?;
+        reader.read_exact(&mut flags_buf)?;
+
+        Ok(PacketHeader {
+            len: u32::from_le_bytes(len_buf),
+            flags: flags_buf[0],
+        })
+    }
 }
 
 pub struct EncryptionMetadata {
@@ -91,7 +101,28 @@ pub struct EncryptionMetadata {
 }
 
 impl EncryptionMetadata {
-    pub fn write() {}
+    pub const SIZE: usize = 32 + 4 + 4;
 
-    pub fn read() {}
+    pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_all(&self.dh)?;
+        writer.write_all(&self.n.to_le_bytes())?;
+        writer.write_all(&self.pn.to_le_bytes())?;
+        Ok(())
+    }
+
+    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
+        let mut dh = [0u8; 32];
+        reader.read_exact(&mut dh)?;
+
+        let mut n_buf = [0u8; 4];
+        let mut pn_buf = [0u8; 4];
+        reader.read_exact(&mut n_buf)?;
+        reader.read_exact(&mut pn_buf)?;
+
+        Ok(EncryptionMetadata {
+            dh,
+            n: u32::from_le_bytes(n_buf),
+            pn: u32::from_le_bytes(pn_buf),
+        })
+    }
 }
