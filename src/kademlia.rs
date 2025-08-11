@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::ops::{AddAssign, SubAssign};
+use std::ops::{AddAssign, Sub, SubAssign};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ID {
@@ -167,15 +167,16 @@ impl RoutingTable {
         }
 
         let index = Self::clz(&Self::xor_keys(&self.public_key, &id.public_key));
-        let bucket = &mut self.buckets[index];
 
         let removed = if let Some(existing) = self.addresses.insert(id.address.clone(), id.clone())
         {
             let other_index = Self::clz(&Self::xor_keys(&self.public_key, &existing.public_key));
             Self::remove_from_bucket(&mut self.buckets[other_index], &existing.public_key)
         } else {
-            Self::remove_from_bucket(bucket, &id.public_key)
+            Self::remove_from_bucket(&mut self.buckets[index], &id.public_key)
         };
+
+        let bucket = &mut self.buckets[index];
 
         if !removed && bucket.count() == BUCKET_SIZE {
             return PutResult::Full;
@@ -209,9 +210,9 @@ impl RoutingTable {
     pub fn get(&self, public_key: &[u8; 32]) -> Option<ID> {
         let index = Self::clz(&Self::xor_keys(&self.public_key, &*public_key));
         let bucket = &self.buckets[index];
-        for id in bucket.iter() {
-            if &id.public_key == public_key {
-                return Some(*id);
+        for id in bucket.entries {
+            if &id.unwrap().public_key == public_key {
+                return Some(id.unwrap());
             }
         }
         None
@@ -247,9 +248,10 @@ impl RoutingTable {
     }
 
     fn fill_sort(&self, dst: &mut [ID], count: &mut usize, public_key: &[u8; 32], index: usize) {
-        for id in self.buckets[index].iter() {
-            if &id.public_key != public_key {
-                match Self::binary_search(&self.public_key, &dst[..*count], &id.public_key) {
+        for id in self.buckets[index].entries {
+            if &id.unwrap().public_key != public_key {
+                match Self::binary_search(&self.public_key, &dst[..*count], &id.unwrap().public_key)
+                {
                     BinarySearchResult::Found(_) => continue,
                     BinarySearchResult::NotFound(insert_index) => {
                         if *count < dst.len() {
@@ -260,7 +262,7 @@ impl RoutingTable {
                         for j in (*count - 1)..insert_index {
                             dst[j + 1] = dst[j];
                         }
-                        dst[insert_index] = *id;
+                        dst[insert_index] = id.unwrap();
                     }
                 }
             }
@@ -310,7 +312,14 @@ impl RoutingTable {
 #[derive(Debug)]
 pub struct StaticRingBuffer<T, Counter, const CAPACITY: usize>
 where
-    Counter: Copy + Default + PartialOrd + AddAssign<u64> + SubAssign<u64> + From<u8> + Into<u64>,
+    Counter: Copy
+        + Default
+        + PartialOrd
+        + AddAssign<u64>
+        + SubAssign<u64>
+        + From<u8>
+        + Into<u64>
+        + Sub<u64, Output = Counter>,
 {
     head: Counter,
     tail: Counter,
@@ -320,7 +329,14 @@ where
 impl<T, Counter, const CAPACITY: usize> StaticRingBuffer<T, Counter, CAPACITY>
 where
     T: Copy,
-    Counter: Copy + Default + PartialOrd + AddAssign<u64> + SubAssign<u64> + From<u8> + Into<u64>,
+    Counter: Copy
+        + Default
+        + PartialOrd
+        + AddAssign<u64>
+        + SubAssign<u64>
+        + From<u8>
+        + Into<u64>
+        + Sub<u64, Output = Counter>,
 {
     pub fn new() -> Self {
         assert!(CAPACITY.is_power_of_two());
@@ -350,19 +366,19 @@ where
         assert!(self.count() < CAPACITY);
         let index = self.mask_index(self.head);
         self.entries[index] = Some(item);
-        self.head += 1usize.into();
+        self.head += 1;
     }
 
     pub fn push_one(&mut self) -> &mut Option<T> {
         assert!(self.count() < CAPACITY);
         let index = self.mask_index(self.head);
-        self.head += 1usize.into();
+        self.head += 1;
         &mut self.entries[index]
     }
 
     pub fn prepend(&mut self, item: T) {
         assert!(self.count() < CAPACITY);
-        self.tail -= 1usize.into();
+        self.tail -= 1;
         let index = self.mask_index(self.tail);
         self.entries[index] = Some(item);
     }
@@ -379,7 +395,7 @@ where
         assert!(self.count() > 0);
         let index = self.mask_index(self.tail);
         let item = self.entries[index].take().expect("Entry must exist");
-        self.tail += 1usize.into();
+        self.tail += 1;
         item
     }
 
@@ -400,7 +416,7 @@ where
         if self.count() == 0 {
             None
         } else {
-            let index = self.mask_index(self.head - 1usize.into());
+            let index = self.mask_index(self.head - 1);
             self.entries[index]
         }
     }
