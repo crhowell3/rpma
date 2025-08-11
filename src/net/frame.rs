@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{IoSliceMut, Read, Write};
 
 use anyhow::{Result, bail};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -204,7 +204,7 @@ pub fn random_nonce() -> [u8; 16] {
 
 pub fn read_frame(client: &mut Client) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
-    let num_bytes = client.socket.read(&mut buf)?;
+    let num_bytes = client.socket.try_read(&mut buf)?;
 
     if num_bytes == 0 {
         bail!("EOF");
@@ -215,16 +215,17 @@ pub fn read_frame(client: &mut Client) -> Result<Vec<u8>> {
     let packet_header = PacketHeader::read(&mut &buf[..])?;
     if buf.len() < packet_header.len as usize {
         let mut extra = vec![0u8; packet_header.len as usize - buf.len()];
-        client.socket.read_exact(&mut extra)?;
+        let mut bufs = [IoSliceMut::new(&mut extra)];
+        client.socket.try_read_vectored(&mut bufs)?;
         buf.extend_from_slice(&extra);
     }
 
     let raw_frame = buf.split_off(0);
-    let session = client.conn.session.as_ref();
+    let session = client.conn.session.as_mut();
 
     let processed_frame = process_frame(
-        client.peer_id.public_key,
-        session,
+        client.peer_id.unwrap().public_key,
+        session.map(|v| &mut **v),
         packet_header,
         &raw_frame,
     )?;
@@ -234,7 +235,7 @@ pub fn read_frame(client: &mut Client) -> Result<Vec<u8>> {
 
 pub fn process_frame(
     peer_id_pk: [u8; 32],
-    session: Option<&Session>,
+    session: Option<&mut Session>,
     packet_header: PacketHeader,
     raw_frame: &[u8],
 ) -> Result<Vec<u8>> {

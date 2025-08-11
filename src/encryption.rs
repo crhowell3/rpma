@@ -1,14 +1,14 @@
 use aes::{
-    cipher::{KeyIvInit, StreamCipher},
     Aes256,
+    cipher::{KeyIvInit, StreamCipher},
 };
 use anyhow::Result;
 use ctr::Ctr128LE;
 use hkdf::{
-    hmac::{Hmac, Mac},
     Hkdf,
+    hmac::{Hmac, Mac},
 };
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use sha2::Sha256;
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
@@ -388,12 +388,13 @@ impl Header {
 }
 
 pub struct Encrypted {
-    dh: [u8; 32],
-    n: u32,
-    pn: u32,
-    cipher_text: Vec<u8>,
+    pub dh: [u8; 32],
+    pub n: u32,
+    pub pn: u32,
+    pub cipher_text: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct Session {
     id: Vec<u8>,
     state: State,

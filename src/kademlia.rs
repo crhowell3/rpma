@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::ops::{AddAssign, SubAssign};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,6 +12,13 @@ pub struct ID {
 }
 
 impl ID {
+    pub fn default() -> Self {
+        Self {
+            public_key: [0u8; 32],
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+        }
+    }
+
     fn size(&self) -> u32 {
         let ip_size = match self.address {
             SocketAddr::V4(_) => 4,
@@ -73,7 +80,8 @@ impl ID {
                 let ip = Ipv6Addr::from(ip_bytes);
                 let scope_id = u32::from_le_bytes(scope_id_bytes);
                 let port = u16::from_le_bytes(port_bytes);
-                SocketAddr::new(IpAddr::V6(ip.with_scope_id(scope_id)), port)
+                let flowinfo = u32::from_le_bytes(flowinfo_bytes);
+                SocketAddr::V6(SocketAddrV6::new(ip, port, flowinfo, scope_id))
             }
             _ => {
                 return Err(std::io::Error::new(
