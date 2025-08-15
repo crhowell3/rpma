@@ -6,15 +6,17 @@ use ed25519_dalek::ed25519::signature::SignerMut;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use encryption::{Encrypted, Session};
 use kademlia::{ID, PutResult, RoutingTable};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use net::frame::{self, RouteFrame, find_node_frame};
 use net::packet::{EncryptionMetadata, Op, Packet, PacketHeader, Tag};
+use rand::RngCore;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::io::{self, BufRead};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
@@ -44,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr: SocketAddr = args.listen_addr.parse()?;
 
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed)?;
+    rand::thread_rng().fill_bytes(&mut seed);
     let signing = SigningKey::from_bytes(&seed);
 
     let node = Arc::new(Node::bind(signing, listen_addr).await?);
@@ -90,40 +92,44 @@ impl<'a> Write for BytesMutWriter<'a> {
 }
 
 pub async fn bootstrap_node_with_peer(node: Arc<Node>, peer: SocketAddr) -> anyhow::Result<()> {
-    let stream = TcpStream::connect(peer).await?;
-    let client = node.get_or_create_client(peer, stream.try_clone()?).await?;
+    let mut stream = TcpStream::connect(peer).await?;
 
-    {
-        let mut c = client.lock().await;
-        Packet {
-            op: Op::Request,
-            tag: Tag::FindNodes,
-        }
-        .write(c.writer())?;
-        find_node_frame::Request {
-            public_key: node.id.public_key,
-        }
-        .write(c.writer())?;
-        c.flush().await?;
+    let mut wbuf = bytes::BytesMut::with_capacity(1024);
+    Packet {
+        op: Op::Request,
+        tag: Tag::FindNodes,
     }
+    .write(&mut wbuf.writer())?;
 
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await?;
+    net::frame::find_node_frame::Request {
+        public_key: node.id.public_key,
+    }
+    .write(&mut wbuf.writer())?;
+    stream.write_all(&wbuf).await?;
+
+    let mut rbuf = vec![0u8; 16 * 1024];
+    let n = stream.read(&mut rbuf).await?;
     if n == 0 {
-        bail!("peer closed");
+        bail!("bootstrap: peer {peer} closed the connection");
     }
+    let mut cur = &rbuf[..n];
 
-    let mut cur = &buf[..n];
     let pkt = Packet::read(&mut cur)?;
     if pkt.op != Op::Response || pkt.tag != Tag::FindNodes {
-        bail!("unexpected response");
+        bail!(
+            "bootstrap: unexpected response from {peer}: op={:?} tag={:?}",
+            pkt.op,
+            pkt.tag
+        );
     }
-    let rsp = find_node_frame::Response::read(&mut cur)?;
-    for id in &rsp.peer_ids {
+
+    let resp = find_node_frame::Response::read(&mut cur)?;
+
+    for id in &resp.peer_ids {
         match node.table.put(*id) {
             PutResult::Full => {}
-            PutResult::Updated => info!("bootstrap: updated {}", id.address),
             PutResult::Inserted => info!("bootstrap: added {}", id.address),
+            PutResult::Updated => info!("bootstrap: updated {}", id.address),
         }
     }
 
@@ -221,8 +227,16 @@ impl Node {
         loop {
             let (stream, addr) = self.listener.accept().await?;
             let me = self.clone();
+
             tokio::spawn(async move {
-                if let Err(e) = me.run_read_loop(stream, addr).await {
+                let (reader, writer) = stream.into_split();
+
+                if let Err(e) = me.register_client(addr, writer).await {
+                    error!("get_or_create_client error for {addr}: {e:?}");
+                    return;
+                }
+
+                if let Err(e) = me.run_read_loop(reader, addr).await {
                     warn!("read loop error from {}: {e:?}", addr);
                 }
             });
@@ -231,23 +245,21 @@ impl Node {
 
     pub async fn run_read_loop(
         self: Arc<Self>,
-        mut stream: TcpStream,
+        mut reader: OwnedReadHalf,
         addr: SocketAddr,
     ) -> io::Result<()> {
-        let client_arc = self.get_or_create_client(addr, stream.try_clone()?).await?;
-
         let mut buf = vec![0u8; 16 * 1024];
         loop {
-            let n = stream.read(&mut buf).await?;
+            let n = reader.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
             let mut cursor = &buf[..n];
 
-            while cursor.remaining() > 0 {
+            while cursor.has_remaining() {
                 let pkt = Packet::read(&mut cursor)?;
-                self.handle_node_packet(client_arc.clone(), pkt, cursor.chunk(), &mut stream)
-                    .await?;
+                let tail = &buf[(n - cursor.remaining())..n];
+                self.handle_node_packet(addr, pkt, tail).await?;
                 break;
             }
         }
@@ -255,26 +267,120 @@ impl Node {
         Ok(())
     }
 
+    async fn configure_peer_after_hello(
+        &self,
+        client: &mut Client,
+        remote_peer: ID,
+        remote_ephemeral_pk: [u8; 32],
+        local_nonce: [u8; 16],
+        remote_nonce: [u8; 16],
+    ) -> io::Result<()> {
+        let mut hasher = Hasher::new();
+
+        hasher.update(&remote_peer.public_key);
+        hasher.update(&self.id.public_key);
+        hasher.update(&remote_ephemeral_pk);
+        hasher.update(&local_nonce);
+        hasher.update(&remote_nonce);
+        let shared = hasher.finalize();
+
+        let mut shared_key = [0u8; 32];
+        shared_key.copy_from_slice(shared.as_bytes());
+
+        let session = self.routing.get_or_create_session(shared_key).await;
+        client.conn.session = Some(session);
+        Ok(())
+    }
+
     async fn handle_node_packet(
-        self: &Arc<Self,
-        client_arc: Arc<Mutex<Client>>,
+        self: &Arc<Self>,
+        client_arc: SocketAddr,
         packet: Packet,
         raw_tail: &[u8],
-        stream: &mut TcpStream,
-    ) -> std::io::Result<()> {
+    ) -> io::Result<()> {
         match packet.op {
             Op::Request => match packet.tag {
                 Tag::Hello => {
-                    // NOOP
+                    let mut rdr = io::Cursor::new(raw_tail);
+                    let hello = frame::HelloFrame::read(&mut rdr).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "data incorrect")
+                    })?;
+                    let sig_bytes = {
+                        let mut s = [0u8; Signature::BYTE_SIZE];
+                        rdr.read_exact(&mut s)?;
+                        s
+                    };
+                    let sig = Signature::from_bytes(&sig_bytes);
+                    let to_verify = &raw_tail[..raw_tail.len() - Signature::BYTE_SIZE];
+                    let peer_vk =
+                        VerifyingKey::from_bytes(&hello.peer_id.public_key).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid public key")
+                        })?;
+                    peer_vk.verify_strict(to_verify, &sig).map_err(|_| {
+                        io::Error::new(io::ErrorKind::PermissionDenied, "bad hello signature")
+                    })?;
+
+                    match self.table.put(hello.peer_id) {
+                        PutResult::Full => info!(""),
+                        PutResult::Updated => info!(""),
+                        PutResult::Inserted => info!(""),
+                    }
+
+                    let mut client = client_arc.lock().await;
+                    client.peer_id = Some(hello.peer_id);
+
+                    let mut local_nonce = [0u8; 16];
+                    rand::thread_rng().fill_bytes(&mut local_nonce);
+
+                    client.conn.set_signed(true);
+                    client.conn.set_encrypted(false);
+
+                    Packet {
+                        op: Op::Response,
+                        tag: Tag::Hello,
+                    }
+                    .write(client.writer())?;
+
+                    frame::HelloFrame {
+                        peer_id: self.id,
+                        public_key: self.id.public_key,
+                        nonce: local_nonce,
+                    }
+                    .write(client.writer())?;
+
+                    client.flush().await?;
+
+                    self.configure_peer_after_hello(
+                        &mut client,
+                        hello.peer_id,
+                        hello.public_key,
+                        local_nonce,
+                        hello.nonce,
+                    )
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                 }
                 Tag::FindNodes => {
-                    // NOOP
+                    let mut rdr = io::Cursor::new(raw_tail);
+                    let q = find_node_frame::Request::read(&mut rdr)?;
+
+                    let mut peers: [ID; 16] = [ID::default(); 16];
+                    let n = self.table.closest_to(&mut peers, &q.public_key);
+
+                    let mut client = client_arc.lock().await;
+                    Packet {
+                        op: Op::Response,
+                        tag: Tag::FindNodes,
+                    }
+                    .write(client.writer())?;
+                    find_node_frame::Response {
+                        peer_ids: peers[..n].to_vec(),
+                    }
+                    .write(client.writer())?;
+                    client.flush().await?;
                 }
                 _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Unexpected tag",
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Unexpected tag"));
                 }
             },
 
@@ -307,34 +413,53 @@ impl Node {
         Ok(())
     }
 
+    async fn register_client(&self, addr: SocketAddr, writer: OwnedWriteHalf) -> io::Result<()> {
+        let mut map = self.clients.lock().await;
+        if !map.contains_key(&addr) {
+            let client = Arc::new(Mutex::new(Client::new(addr, writer, self.signer.clone())));
+            map.insert(addr, client);
+        }
+
+        Ok(())
+    }
+
     pub async fn get_or_create_client(
         &mut self,
         addr: SocketAddr,
-        stream: TcpStream,
+        writer: OwnedWriteHalf,
     ) -> io::Result<Arc<Mutex<Client>>> {
         if let Some(c) = self.clients.lock().await.get(&addr) {
             return Ok(c.clone());
         }
-        let client = Arc::new(Mutex::new(Client::new(stream, addr, self.signer.clone())));
-        self.clients.lock().insert(addr, client.clone());
+        let client = Arc::new(Mutex::new(Client::new(addr, writer, self.signer.clone())));
+        self.clients.lock().await.insert(addr, client.clone());
         Ok(client)
     }
 }
 
 struct Client {
-    stream: TcpStream,
     address: SocketAddr,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
     conn: Connection,
     peer_id: Option<ID>,
     read_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Client {
-    pub fn new(stream: TcpStream, address: SocketAddr, node_signer: SigningKey) -> Self {
+    pub fn new(address: SocketAddr, writer: OwnedWriteHalf, node_signer: SigningKey) -> Self {
+        let writer = Arc::new(Mutex::new(writer));
+        let conn = Connection {
+            write_buffer: bytes::BytesMut::with_capacity(2048),
+            backend: Backend::Socket(writer.clone()),
+            flags: 0,
+            node_signer,
+            session: None,
+        };
+
         Self {
-            stream,
             address,
-            conn: Connection::new_socket(stream.clone(), node_signer),
+            writer,
+            conn,
             peer_id: None,
             read_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -358,8 +483,8 @@ const FLAG_SIGNED: u8 = 0x1;
 const FLAG_ENCRYPTED: u8 = 0x2;
 
 pub enum Backend {
-    Socket(TcpStream),
-    Connection(*mut Connection),
+    Socket(Arc<Mutex<OwnedWriteHalf>>),
+    Buffer(Arc<Mutex<BytesMut>>),
 }
 
 struct Connection {
@@ -381,10 +506,10 @@ impl Connection {
         }
     }
 
-    fn new_nested(conn: *mut Connection, node_signer: SigningKey) -> Self {
+    fn new_nested(parent_buf: Arc<Mutex<BytesMut>>, node_signer: SigningKey) -> Self {
         Self {
             write_buffer: BytesMut::with_capacity(2048),
-            backend: Backend::Connection(conn),
+            backend: Backend::Buffer(parent_buf),
             flags: 0,
             node_signer,
             session: None,
@@ -478,9 +603,10 @@ impl Connection {
             Backend::Socket(stream) => {
                 stream.write_all(&out).await?;
             }
-            Backend::Connection(conn) => unsafe {
-                (**conn).writer().put_slice(&out);
-            },
+            Backend::Buffer(parent) => {
+                let mut parent_buf = parent.lock().await;
+                parent_buf.put_slice(&out);
+            }
         }
 
         Ok(())
