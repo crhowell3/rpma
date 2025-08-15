@@ -408,7 +408,7 @@ impl Session {
         }
     }
 
-    fn init_remote_key(id: Vec<u8>, shared_key: [u8; 32], remote_key: [u8; 32]) -> Self {
+    pub fn init_remote_key(id: Vec<u8>, shared_key: [u8; 32], remote_key: [u8; 32]) -> Self {
         let keys = KeyPair::generate();
         let mut session = Self {
             id,

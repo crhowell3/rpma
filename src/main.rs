@@ -1,5 +1,5 @@
 use anyhow::bail;
-use blake3::{Hash, Hasher};
+use blake3::Hasher;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use clap::{Parser, arg};
 use ed25519_dalek::ed25519::signature::SignerMut;
@@ -7,18 +7,18 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use encryption::{Encrypted, Session};
 use kademlia::{ID, PutResult, RoutingTable};
 use log::{debug, error, info, warn};
-use net::frame::{self, RouteFrame, find_node_frame};
+use net::frame::{self, find_node_frame};
 use net::packet::{EncryptionMetadata, Op, Packet, PacketHeader, Tag};
 use rand::RngCore;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::io::{self, BufRead};
-use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
 mod encryption;
 mod kademlia;
@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         let n = node.clone();
         tokio::spawn(async move {
             if let Err(e) = n.run_accept_loop().await {
-                eprintln!("Error in accept loop: {:?}", e);
+                eprintln!("Error in accept loop: {e:?}");
             }
         });
     }
@@ -76,35 +76,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub struct BytesMutWriter<'a> {
-    buf: &'a mut BytesMut,
-}
-
-impl<'a> Write for BytesMutWriter<'a> {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 pub async fn bootstrap_node_with_peer(node: Arc<Node>, peer: SocketAddr) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(peer).await?;
 
-    let mut wbuf = bytes::BytesMut::with_capacity(1024);
+    let wbuf = bytes::BytesMut::with_capacity(1024);
     Packet {
         op: Op::Request,
         tag: Tag::FindNodes,
     }
-    .write(&mut wbuf.writer())?;
+    .write(&mut wbuf.clone().writer())?;
 
     net::frame::find_node_frame::Request {
         public_key: node.id.public_key,
     }
-    .write(&mut wbuf.writer())?;
+    .write(&mut wbuf.clone().writer())?;
     stream.write_all(&wbuf).await?;
 
     let mut rbuf = vec![0u8; 16 * 1024];
@@ -123,13 +108,16 @@ pub async fn bootstrap_node_with_peer(node: Arc<Node>, peer: SocketAddr) -> anyh
         );
     }
 
-    let resp = find_node_frame::Response::read(&mut cur)?;
+    let rsp = find_node_frame::Response::read(&mut cur)?;
 
-    for id in &resp.peer_ids {
-        match node.table.put(*id) {
-            PutResult::Full => {}
-            PutResult::Inserted => info!("bootstrap: added {}", id.address),
-            PutResult::Updated => info!("bootstrap: updated {}", id.address),
+    {
+        let mut table = node.table.write().unwrap();
+        for id in &rsp.peer_ids {
+            match table.put(*id) {
+                PutResult::Full => {}
+                PutResult::Inserted => info!("bootstrap: added {}", id.address),
+                PutResult::Updated => info!("bootstrap: updated {}", id.address),
+            }
         }
     }
 
@@ -163,7 +151,7 @@ async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
             }
             cmd if cmd.starts_with("echo ") => {
                 let message = &cmd[5..];
-                println!("{}", message);
+                println!("{message}");
             }
             "peers" => {
                 println!("Connected to {} peers", node.clients.lock().await.len());
@@ -195,9 +183,10 @@ struct Node {
     listener: TcpListener,
     signer: SigningKey,
     verifier: VerifyingKey,
-    table: RoutingTable,
-    clients: Mutex<HashMap<SocketAddr, Arc<Mutex<Client>>>>,
-    processed_nonces: Mutex<HashSet<[u8; 16]>>,
+    keys: Arc<KeyPair>,
+    table: RwLock<RoutingTable>,
+    clients: AsyncMutex<HashMap<SocketAddr, Arc<AsyncMutex<Client>>>>,
+    processed_nonces: AsyncMutex<HashSet<[u8; 16]>>,
     routing: Routing,
 }
 
@@ -216,9 +205,10 @@ impl Node {
             listener,
             signer,
             verifier,
-            table: RoutingTable::new(verifier.to_bytes()),
-            clients: Mutex::new(HashMap::new()),
-            processed_nonces: Mutex::new(HashSet::new()),
+            keys: Arc::new(KeyPair::generate()),
+            table: RwLock::new(RoutingTable::new(verifier.to_bytes())),
+            clients: AsyncMutex::new(HashMap::new()),
+            processed_nonces: AsyncMutex::new(HashSet::new()),
             routing: Routing::new(),
         })
     }
@@ -226,7 +216,7 @@ impl Node {
     pub async fn run_accept_loop(self: Arc<Self>) -> std::io::Result<()> {
         loop {
             let (stream, addr) = self.listener.accept().await?;
-            let me = self.clone();
+            let me = std::sync::Arc::clone(&self);
 
             tokio::spawn(async move {
                 let (reader, writer) = stream.into_split();
@@ -237,7 +227,7 @@ impl Node {
                 }
 
                 if let Err(e) = me.run_read_loop(reader, addr).await {
-                    warn!("read loop error from {}: {e:?}", addr);
+                    warn!("read loop error from {addr}: {e:?}");
                 }
             });
         }
@@ -260,7 +250,6 @@ impl Node {
                 let pkt = Packet::read(&mut cursor)?;
                 let tail = &buf[(n - cursor.remaining())..n];
                 self.handle_node_packet(addr, pkt, tail).await?;
-                break;
             }
         }
 
@@ -282,19 +271,22 @@ impl Node {
         hasher.update(&remote_ephemeral_pk);
         hasher.update(&local_nonce);
         hasher.update(&remote_nonce);
-        let shared = hasher.finalize();
+        let digest = hasher.finalize();
 
         let mut shared_key = [0u8; 32];
-        shared_key.copy_from_slice(shared.as_bytes());
+        shared_key.copy_from_slice(digest.as_bytes());
 
-        let session = self.routing.get_or_create_session(shared_key).await;
+        let session = self
+            .routing
+            .get_or_create_session(shared_key, KeyType::KeyPair((*self.keys).clone()))
+            .await;
         client.conn.session = Some(session);
         Ok(())
     }
 
     async fn handle_node_packet(
         self: &Arc<Self>,
-        client_arc: SocketAddr,
+        client_addr: SocketAddr,
         packet: Packet,
         raw_tail: &[u8],
     ) -> io::Result<()> {
@@ -305,11 +297,15 @@ impl Node {
                     let hello = frame::HelloFrame::read(&mut rdr).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidData, "data incorrect")
                     })?;
+
+                    // Read trailing signature
                     let sig_bytes = {
                         let mut s = [0u8; Signature::BYTE_SIZE];
-                        rdr.read_exact(&mut s)?;
+                        std::io::Read::read_exact(&mut rdr, &mut s)?;
                         s
                     };
+
+                    // Verify signature
                     let sig = Signature::from_bytes(&sig_bytes);
                     let to_verify = &raw_tail[..raw_tail.len() - Signature::BYTE_SIZE];
                     let peer_vk =
@@ -320,11 +316,21 @@ impl Node {
                         io::Error::new(io::ErrorKind::PermissionDenied, "bad hello signature")
                     })?;
 
-                    match self.table.put(hello.peer_id) {
-                        PutResult::Full => info!(""),
-                        PutResult::Updated => info!(""),
-                        PutResult::Inserted => info!(""),
+                    {
+                        let mut table = self.table.write().unwrap();
+                        match table.put(hello.peer_id) {
+                            PutResult::Full => info!("hello: table full; peer ignored"),
+                            PutResult::Updated => info!("hello: peer updated"),
+                            PutResult::Inserted => info!("hello: peer registered"),
+                        }
                     }
+
+                    let client_arc = {
+                        let map = self.clients.lock().await;
+                        map.get(&client_addr).cloned().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "client not found")
+                        })?
+                    };
 
                     let mut client = client_arc.lock().await;
                     client.peer_id = Some(hello.peer_id);
@@ -335,18 +341,21 @@ impl Node {
                     client.conn.set_signed(true);
                     client.conn.set_encrypted(false);
 
-                    Packet {
-                        op: Op::Response,
-                        tag: Tag::Hello,
-                    }
-                    .write(client.writer())?;
+                    {
+                        let mut w = client.writer().writer();
+                        Packet {
+                            op: Op::Response,
+                            tag: Tag::Hello,
+                        }
+                        .write(&mut w)?;
 
-                    frame::HelloFrame {
-                        peer_id: self.id,
-                        public_key: self.id.public_key,
-                        nonce: local_nonce,
+                        frame::HelloFrame {
+                            peer_id: self.id,
+                            public_key: self.id.public_key,
+                            nonce: local_nonce,
+                        }
+                        .write(&mut w)?;
                     }
-                    .write(client.writer())?;
 
                     client.flush().await?;
 
@@ -362,21 +371,38 @@ impl Node {
                 }
                 Tag::FindNodes => {
                     let mut rdr = io::Cursor::new(raw_tail);
-                    let q = find_node_frame::Request::read(&mut rdr)?;
+                    let q = find_node_frame::Request::read(&mut rdr).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("bad FindNodes: {e}"))
+                    })?;
 
-                    let mut peers: [ID; 16] = [ID::default(); 16];
-                    let n = self.table.closest_to(&mut peers, &q.public_key);
+                    let (peers_vec, _n) = {
+                        let table = self.table.read().unwrap();
+                        let mut peers: [ID; 16] = [ID::default(); 16];
+                        let n = table.closest_to(&mut peers, &q.public_key);
+                        (peers[..n].to_vec(), n)
+                    };
+
+                    let client_arc = {
+                        let map = self.clients.lock().await;
+                        map.get(&client_addr).cloned().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "client not found")
+                        })?
+                    };
 
                     let mut client = client_arc.lock().await;
-                    Packet {
-                        op: Op::Response,
-                        tag: Tag::FindNodes,
+                    {
+                        let mut w = client.writer().writer();
+                        Packet {
+                            op: Op::Response,
+                            tag: Tag::FindNodes,
+                        }
+                        .write(&mut w)?;
+                        find_node_frame::Response {
+                            peer_ids: peers_vec,
+                        }
+                        .write(&mut w)?;
+                        let _ = w.into_inner();
                     }
-                    .write(client.writer())?;
-                    find_node_frame::Response {
-                        peer_ids: peers[..n].to_vec(),
-                    }
-                    .write(client.writer())?;
                     client.flush().await?;
                 }
                 _ => {
@@ -416,7 +442,11 @@ impl Node {
     async fn register_client(&self, addr: SocketAddr, writer: OwnedWriteHalf) -> io::Result<()> {
         let mut map = self.clients.lock().await;
         if !map.contains_key(&addr) {
-            let client = Arc::new(Mutex::new(Client::new(addr, writer, self.signer.clone())));
+            let client = Arc::new(AsyncMutex::new(Client::new(
+                addr,
+                writer,
+                self.signer.clone(),
+            )));
             map.insert(addr, client);
         }
 
@@ -427,11 +457,15 @@ impl Node {
         &mut self,
         addr: SocketAddr,
         writer: OwnedWriteHalf,
-    ) -> io::Result<Arc<Mutex<Client>>> {
+    ) -> io::Result<Arc<AsyncMutex<Client>>> {
         if let Some(c) = self.clients.lock().await.get(&addr) {
             return Ok(c.clone());
         }
-        let client = Arc::new(Mutex::new(Client::new(addr, writer, self.signer.clone())));
+        let client = Arc::new(AsyncMutex::new(Client::new(
+            addr,
+            writer,
+            self.signer.clone(),
+        )));
         self.clients.lock().await.insert(addr, client.clone());
         Ok(client)
     }
@@ -439,7 +473,7 @@ impl Node {
 
 struct Client {
     address: SocketAddr,
-    writer: Arc<Mutex<OwnedWriteHalf>>,
+    writer: Arc<AsyncMutex<OwnedWriteHalf>>,
     conn: Connection,
     peer_id: Option<ID>,
     read_notify: Arc<tokio::sync::Notify>,
@@ -447,7 +481,7 @@ struct Client {
 
 impl Client {
     pub fn new(address: SocketAddr, writer: OwnedWriteHalf, node_signer: SigningKey) -> Self {
-        let writer = Arc::new(Mutex::new(writer));
+        let writer = Arc::new(AsyncMutex::new(writer));
         let conn = Connection {
             write_buffer: bytes::BytesMut::with_capacity(2048),
             backend: Backend::Socket(writer.clone()),
@@ -483,7 +517,7 @@ const FLAG_SIGNED: u8 = 0x1;
 const FLAG_ENCRYPTED: u8 = 0x2;
 
 pub enum Backend {
-    Socket(Arc<Mutex<OwnedWriteHalf>>),
+    Socket(Arc<AsyncMutex<OwnedWriteHalf>>),
     Buffer(Arc<Mutex<BytesMut>>),
 }
 
@@ -492,14 +526,14 @@ struct Connection {
     pub backend: Backend,
     pub flags: u8,
     pub node_signer: SigningKey,
-    pub session: Option<Arc<Mutex<Session>>>,
+    pub session: Option<Arc<AsyncMutex<Session>>>,
 }
 
 impl Connection {
-    fn new_socket(stream: TcpStream, node_signer: SigningKey) -> Self {
+    fn new_socket(writer: Arc<AsyncMutex<OwnedWriteHalf>>, node_signer: SigningKey) -> Self {
         Self {
             write_buffer: BytesMut::with_capacity(2048),
-            backend: Backend::Socket(stream),
+            backend: Backend::Socket(writer),
             flags: 0,
             node_signer,
             session: None,
@@ -548,7 +582,7 @@ impl Connection {
         let mut encryption_metadata: Option<EncryptionMetadata> = None;
 
         if (self.flags & 0x2) != 0 {
-            let session = self
+            let mut session_guard = self
                 .session
                 .as_ref()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Missing session"))?
@@ -560,7 +594,7 @@ impl Connection {
                 dh,
                 n,
                 pn,
-            } = session.encrypt(payload.to_vec());
+            } = session_guard.encrypt(payload.to_vec());
 
             encryption_metadata = Some(EncryptionMetadata { dh, n, pn });
             payload = Bytes::from(cipher_text);
@@ -579,17 +613,21 @@ impl Connection {
         let packet_len = payload.len() + signature_len + metadata_len;
 
         let mut out = BytesMut::with_capacity(5 + packet_len);
-        PacketHeader {
-            flags: self.flags,
-            len: packet_len as u32,
-        }
-        .write(&mut out)?;
+        {
+            let mut w = out.writer();
+            PacketHeader {
+                flags: self.flags,
+                len: packet_len as u32,
+            }
+            .write(&mut w)?;
 
-        if let Some(meta) = &encryption_metadata {
-            meta.write(&mut out)?;
-        }
+            if let Some(meta) = &encryption_metadata {
+                meta.write(&mut w)?;
+            }
 
-        out.extend_from_slice(&payload);
+            std::io::Write::write_all(&mut w, &payload)?;
+            out = w.into_inner();
+        }
 
         if (self.flags & 0x1) != 0 {
             let msg = &out[5..];
@@ -600,11 +638,12 @@ impl Connection {
         debug_assert_eq!(out.len(), 5 + packet_len);
 
         match &mut self.backend {
-            Backend::Socket(stream) => {
-                stream.write_all(&out).await?;
+            Backend::Socket(writer_arc) => {
+                let mut writer = writer_arc.lock().await;
+                writer.write_all(&out).await?;
             }
             Backend::Buffer(parent) => {
-                let mut parent_buf = parent.lock().await;
+                let mut parent_buf = parent.lock().unwrap();
                 parent_buf.put_slice(&out);
             }
         }
@@ -614,7 +653,7 @@ impl Connection {
 }
 
 pub struct Routing {
-    sessions: Mutex<HashMap<[u8; 32], Arc<Mutex<Session>>>>,
+    sessions: Mutex<HashMap<[u8; 32], Arc<AsyncMutex<Session>>>>,
 }
 
 impl Routing {
@@ -625,13 +664,15 @@ impl Routing {
     }
 
     pub fn next_hop(node: &Node, src: [u8; 32], dst: [u8; 32], prev_hops: &[ID]) -> Option<ID> {
-        if let Some(peer_id) = node.table.get(&dst) {
-            return Some(peer_id);
+        {
+            let table = node.table.read().unwrap();
+            if let Some(peer_id) = table.get(&dst) {
+                return Some(peer_id);
+            }
         }
 
         let mut candidates: [ID; 16] = [ID::default(); 16];
-        let len = node.table.closest_to(&mut candidates, &dst);
-
+        let len = node.table.read().unwrap().closest_to(&mut candidates, &dst);
         for i in 0..len {
             let mut ok = true;
             for prev in prev_hops {
@@ -652,11 +693,24 @@ impl Routing {
         None
     }
 
-    pub async fn get_or_create_session(&self, shared: [u8; 32]) -> Arc<Mutex<Session>> {
-        let mut guard = self.sessions.lock().await;
-        guard
-            .entry(shared)
-            .or_insert_with(|| Arc::new(Mutex::new(Session::new(shared))))
-            .clone()
+    pub async fn get_or_create_session(
+        &self,
+        key: [u8; 32],
+        key_type: KeyType,
+    ) -> Arc<AsyncMutex<Session>> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(&key) {
+            return existing.clone();
+        }
+
+        let session = match key_type {
+            KeyType::KeyPair(kp) => Session::new(&[], key, kp),
+            KeyType::RemoteKey(remote_key) => {
+                Session::init_remote_key((&[]).to_vec(), key, remote_key)
+            }
+        };
+
+        let arc = Arc::new(AsyncMutex::new(session));
+        self.sessions.lock().unwrap().insert(key, arc.clone());
+        arc
     }
 }

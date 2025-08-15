@@ -1,8 +1,10 @@
-use std::io::{IoSliceMut, Read, Write};
+use std::io::{self, Read, Write};
 
-use anyhow::{Result, bail};
 use ed25519_dalek::{Signature, VerifyingKey};
+use log::error;
 use rand::RngCore;
+use tokio::io::AsyncReadExt;
+use tokio::net::tcp::OwnedReadHalf;
 
 use crate::Client;
 use crate::encryption::{Encrypted, Session};
@@ -16,7 +18,7 @@ pub struct HelloFrame {
 }
 
 impl HelloFrame {
-    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
+    pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let peer_id = ID::read(&mut *reader)?;
 
         let mut public_key = [0u8; 32];
@@ -32,7 +34,7 @@ impl HelloFrame {
         })
     }
 
-    pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
+    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         self.peer_id.write(&mut *writer)?;
         writer.write_all(&self.public_key)?;
         writer.write_all(&self.nonce)?;
@@ -48,12 +50,12 @@ pub mod find_node_frame {
     }
 
     impl Request {
-        pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
+        pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
             writer.write_all(&self.public_key)?;
             Ok(())
         }
 
-        pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
+        pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
             let mut public_key = [0u8; 32];
             reader.read_exact(&mut public_key)?;
             Ok(Self { public_key })
@@ -65,7 +67,7 @@ pub mod find_node_frame {
     }
 
     impl Response {
-        pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
+        pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
             writer.write_all(&[self.peer_ids.len() as u8])?;
             for peer_id in &self.peer_ids {
                 peer_id.write(&mut *writer)?;
@@ -74,7 +76,7 @@ pub mod find_node_frame {
             Ok(())
         }
 
-        pub fn read<R: Read>(&self, reader: &mut R) -> Result<Self> {
+        pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
             let mut len_buf = [0u8; 1];
             reader.read_exact(&mut len_buf)?;
             let len = len_buf[0] as usize;
@@ -96,7 +98,7 @@ pub struct RouteFrame {
 }
 
 impl RouteFrame {
-    pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
+    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&self.src)?;
         writer.write_all(&self.dst)?;
         writer.write_all(&[self.hops.len() as u8])?;
@@ -106,7 +108,7 @@ impl RouteFrame {
         Ok(())
     }
 
-    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
+    pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut src = [0u8; 32];
         reader.read_exact(&mut src)?;
 
@@ -143,13 +145,13 @@ pub struct EchoFrame {
 }
 
 impl EchoFrame {
-    pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
+    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&(self.txt.len() as u64).to_le_bytes())?;
         writer.write_all(&self.txt)?;
         Ok(())
     }
 
-    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
+    pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut len_buf = [0u8; 8];
         reader.read_exact(&mut len_buf)?;
         let len = u64::from_le_bytes(len_buf) as usize;
@@ -169,7 +171,7 @@ pub struct BroadcastFrame {
 }
 
 impl BroadcastFrame {
-    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
+    pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut src = [0u8; 32];
         reader.read_exact(&mut src)?;
 
@@ -187,7 +189,7 @@ impl BroadcastFrame {
         Ok(Self { src, nonce, ts, n })
     }
 
-    pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
+    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&self.src)?;
         writer.write_all(&self.nonce)?;
         writer.write_all(&self.ts.to_le_bytes())?;
@@ -202,35 +204,44 @@ pub fn random_nonce() -> [u8; 16] {
     buf
 }
 
-pub fn read_frame(client: &mut Client) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(1024);
-    let num_bytes = client.socket.try_read(&mut buf)?;
+fn invalid_data<E>(e: E) -> io::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    io::Error::new(io::ErrorKind::InvalidData, e)
+}
 
-    if num_bytes == 0 {
-        bail!("EOF");
+pub async fn read_frame(reader: &mut OwnedReadHalf, client: &mut Client) -> io::Result<Vec<u8>> {
+    const HEADER_SIZE: usize = 5;
+    let mut header_bytes = [0u8; 5];
+    reader.read_exact(&mut header_bytes).await?;
+
+    let mut hdr_cursor = io::Cursor::new(&header_bytes[..]);
+    let packet_header = PacketHeader::read(&mut hdr_cursor).map_err(invalid_data)?;
+
+    let body_len = packet_header.len as usize;
+    let mut body = vec![0u8; body_len];
+    if body_len > 0 {
+        reader.read_exact(&mut body).await?;
     }
 
-    buf.truncate(num_bytes);
+    let mut raw_frame = Vec::with_capacity(HEADER_SIZE + body_len);
+    raw_frame.extend_from_slice(&header_bytes);
+    raw_frame.extend_from_slice(&body);
 
-    let packet_header = PacketHeader::read(&mut &buf[..])?;
-    if buf.len() < packet_header.len as usize {
-        let mut extra = vec![0u8; packet_header.len as usize - buf.len()];
-        let mut bufs = [IoSliceMut::new(&mut extra)];
-        client.socket.try_read_vectored(&mut bufs)?;
-        buf.extend_from_slice(&extra);
-    }
+    let peer_pk = client
+        .peer_id
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "peer_id not set"))?
+        .public_key;
 
-    let raw_frame = buf.split_off(0);
-    let session = client.conn.session.as_mut();
+    let processed = if let Some(session_arc) = client.conn.session.as_ref() {
+        let mut sess = session_arc.lock().await;
+        process_frame(peer_pk, Some(&mut *sess), packet_header, &raw_frame).map_err(invalid_data)?
+    } else {
+        process_frame(peer_pk, None, packet_header, &raw_frame).map_err(invalid_data)?
+    };
 
-    let processed_frame = process_frame(
-        client.peer_id.unwrap().public_key,
-        session.map(|v| &mut **v),
-        packet_header,
-        &raw_frame,
-    )?;
-
-    Ok(processed_frame)
+    Ok(processed)
 }
 
 pub fn process_frame(
@@ -238,12 +249,12 @@ pub fn process_frame(
     session: Option<&mut Session>,
     packet_header: PacketHeader,
     raw_frame: &[u8],
-) -> Result<Vec<u8>> {
+) -> io::Result<Vec<u8>> {
     let mut frame = raw_frame.to_vec();
 
     if packet_header.flags & 0x1 != 0 {
         if frame.len() < 64 {
-            bail!("Frame too short for signature");
+            error!("Frame too short for signature");
         }
         let signature_bytes: [u8; 64] = frame[frame.len() - 64..].try_into().unwrap();
         frame.truncate(frame.len() - 64);
@@ -252,7 +263,8 @@ pub fn process_frame(
     }
 
     if packet_header.flags & 0x2 != 0 {
-        let s = session.ok_or_else(|| anyhow::anyhow!("MissingSession"))?;
+        let s = session
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "session does not exist"))?;
         let mut reader = &frame[..];
         let encryption_metadata = EncryptionMetadata::read(&mut reader)?;
 
@@ -267,9 +279,13 @@ pub fn process_frame(
     Ok(frame)
 }
 
-pub fn verify_signature(public_key: [u8; 32], raw_signature: [u8; 64], msg: &[u8]) -> Result<()> {
-    let pk = VerifyingKey::from_bytes(&public_key)?;
+pub fn verify_signature(
+    public_key: [u8; 32],
+    raw_signature: [u8; 64],
+    msg: &[u8],
+) -> io::Result<()> {
+    let pk = VerifyingKey::from_bytes(&public_key).map_err(invalid_data)?;
     let sig = Signature::from_bytes(&raw_signature);
-    pk.verify_strict(msg, &sig)?;
+    pk.verify_strict(msg, &sig).map_err(invalid_data)?;
     Ok(())
 }
