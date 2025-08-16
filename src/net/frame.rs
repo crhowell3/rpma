@@ -231,7 +231,7 @@ pub async fn read_frame(reader: &mut OwnedReadHalf, client: &mut Client) -> io::
 
     let peer_pk = client
         .peer_id
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "peer_id not set"))?
+        .ok_or_else(|| io::Error::other("peer_id not set"))?
         .public_key;
 
     let processed = if let Some(session_arc) = client.conn.session.as_ref() {
@@ -263,8 +263,7 @@ pub fn process_frame(
     }
 
     if packet_header.flags & 0x2 != 0 {
-        let s = session
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "session does not exist"))?;
+        let s = session.ok_or_else(|| io::Error::other("session does not exist"))?;
         let mut reader = &frame[..];
         let encryption_metadata = EncryptionMetadata::read(&mut reader)?;
 

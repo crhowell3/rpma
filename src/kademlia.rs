@@ -105,7 +105,7 @@ impl ID {
 impl fmt::Display for ID {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in &self.public_key {
-            write!(f, "{:02x}", byte)?;
+            write!(f, "{byte:02x}")?;
         }
         write!(f, "[{}]", self.address)
     }
@@ -168,8 +168,7 @@ impl RoutingTable {
 
         let index = Self::clz(&Self::xor_keys(&self.public_key, &id.public_key));
 
-        let removed = if let Some(existing) = self.addresses.insert(id.address.clone(), id.clone())
-        {
+        let removed = if let Some(existing) = self.addresses.insert(id.address, id) {
             let other_index = Self::clz(&Self::xor_keys(&self.public_key, &existing.public_key));
             Self::remove_from_bucket(&mut self.buckets[other_index], &existing.public_key)
         } else {
@@ -197,7 +196,7 @@ impl RoutingTable {
             return false;
         }
 
-        let index = Self::clz(&Self::xor_keys(&self.public_key, &*public_key));
+        let index = Self::clz(&Self::xor_keys(&self.public_key, public_key));
         let bucket = &mut self.buckets[index];
         if Self::remove_from_bucket(bucket, public_key) {
             self.len -= 1;
@@ -208,7 +207,7 @@ impl RoutingTable {
     }
 
     pub fn get(&self, public_key: &[u8; 32]) -> Option<ID> {
-        let index = Self::clz(&Self::xor_keys(&self.public_key, &*public_key));
+        let index = Self::clz(&Self::xor_keys(&self.public_key, public_key));
         let bucket = &self.buckets[index];
         for id in bucket.entries {
             if &id.unwrap().public_key == public_key {
@@ -220,7 +219,7 @@ impl RoutingTable {
 
     pub fn closest_to(&self, dst: &mut [ID], public_key: &[u8; 32]) -> usize {
         let mut count = 0;
-        let index = Self::clz(&Self::xor_keys(&self.public_key, &*public_key));
+        let index = Self::clz(&Self::xor_keys(&self.public_key, public_key));
 
         if &self.public_key != public_key {
             self.fill_sort(dst, &mut count, public_key, index);
@@ -295,8 +294,8 @@ impl RoutingTable {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let mid_xor = Self::xor_keys(&slice[mid].public_key, &*our_pk);
-            let target_xor = Self::xor_keys(&*target_pk, &*our_pk);
+            let mid_xor = Self::xor_keys(&slice[mid].public_key, our_pk);
+            let target_xor = Self::xor_keys(target_pk, our_pk);
 
             match mid_xor.cmp(&target_xor) {
                 Ordering::Less => left = mid + 1,

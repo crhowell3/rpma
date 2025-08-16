@@ -24,8 +24,8 @@ pub struct KeyPair {
 
 impl KeyPair {
     pub fn generate() -> Self {
-        let mut rng = OsRng {};
-        let secret = StaticSecret::random_from_rng(&mut rng);
+        let rng = OsRng {};
+        let secret = StaticSecret::random_from_rng(rng);
         let public = PublicKey::from(&secret);
         Self { secret, public }
     }
@@ -64,7 +64,7 @@ fn kdf_rk(root_key: [u8; 32], dh_out: [u8; 32]) -> RootKeyWithHeader {
     let (_prk, hk) = Hkdf::<Sha256>::extract(Some(root_key.as_slice()), &dh_out);
     let mut out = [0u8; 96];
     let info = "rsZUpEuXUqqwXBvSy3EcievAh4cMj6QL";
-    hk.expand(info.as_bytes(), &mut out);
+    let _ = hk.expand(info.as_bytes(), &mut out);
 
     RootKeyWithHeader {
         root_key: out[0..32].try_into().expect("Slice with incorrect length"),
@@ -74,7 +74,7 @@ fn kdf_rk(root_key: [u8; 32], dh_out: [u8; 32]) -> RootKeyWithHeader {
 }
 
 #[derive(Debug, Clone)]
-struct KdfResult {
+pub struct KdfResult {
     chain_key: [u8; 32],
     message_key: [u8; 32],
 }
@@ -99,7 +99,7 @@ pub fn kdf_ck(ck: &[u8]) -> KdfResult {
 }
 
 fn dh_gen(kp: KeyPair, public_key: [u8; 32]) -> Result<[u8; 32]> {
-    let secret = StaticSecret::from(kp.secret);
+    let secret = kp.secret;
     let public = PublicKey::from(public_key);
     let shared_secret = secret.diffie_hellman(&public);
     Ok(shared_secret.to_bytes())
@@ -115,7 +115,7 @@ fn derive_enc_keys(mk: [u8; 32]) -> DerivedKeys {
     let (_prk, hk) = Hkdf::<Sha256>::extract(Some(&mk), &mk);
     let mut out = [0u8; 80];
     let info = "pcwSByyx2CRdryCffXJwy7xgVZWtW5Sh";
-    hk.expand(info.as_bytes(), &mut out);
+    let _ = hk.expand(info.as_bytes(), &mut out);
 
     DerivedKeys {
         enc_key: out[0..32].try_into().expect(""),
@@ -192,15 +192,13 @@ impl RootChain {
 
         self.chain_key = keys.root_key;
 
-        let chain_link = ChainLink {
+        ChainLink {
             chain: Chain {
                 chain_key: keys.chain_key,
                 n: 0,
             },
             nhk: keys.new_header_key,
-        };
-
-        chain_link
+        }
     }
 }
 
@@ -217,7 +215,7 @@ impl Chain {
         self.n += 1;
         self.chain_key = keys.chain_key;
 
-        return keys.message_key;
+        keys.message_key
     }
 }
 
@@ -353,7 +351,7 @@ impl KeyStorage {
         mk: [u8; 32],
         seq_num: u32,
     ) -> Result<(), CryptoError> {
-        let inner_map = self.storage.entry(pub_key).or_insert_with(HashMap::new);
+        let inner_map = self.storage.entry(pub_key).or_default();
 
         inner_map.insert(
             msg_num,
@@ -475,7 +473,7 @@ impl Session {
         next_state.keys_count += 1;
 
         for skipped in skipped_keys {
-            next_state.mk_skipped.put(
+            let _ = next_state.mk_skipped.put(
                 self.id.as_slice(),
                 skipped.key,
                 skipped.nr,

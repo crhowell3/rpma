@@ -6,14 +6,17 @@ use ed25519_dalek::ed25519::signature::SignerMut;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use encryption::{Encrypted, Session};
 use kademlia::{ID, PutResult, RoutingTable};
+use libc::QCMD;
 use log::{debug, error, info, warn};
 use net::frame::{self, find_node_frame};
 use net::packet::{EncryptionMetadata, Op, Packet, PacketHeader, Tag};
 use rand::RngCore;
+use rand::rngs::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::io::{self, BufRead};
 use std::net::SocketAddr;
+use std::process::ExitCode;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -76,47 +79,67 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn bootstrap_node_with_peer(node: Arc<Node>, peer: SocketAddr) -> anyhow::Result<()> {
+async fn bootstrap_node_with_peer(node: Arc<Node>, peer: SocketAddr) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(peer).await?;
 
-    let wbuf = bytes::BytesMut::with_capacity(1024);
-    Packet {
-        op: Op::Request,
-        tag: Tag::FindNodes,
-    }
-    .write(&mut wbuf.clone().writer())?;
+    let body = bytes::BytesMut::with_capacity(1024);
+    {
+        let mut w = body.clone().writer();
+        Packet {
+            op: Op::Request,
+            tag: Tag::FindNodes,
+        }
+        .write(&mut w)?;
 
-    net::frame::find_node_frame::Request {
-        public_key: node.id.public_key,
+        net::frame::find_node_frame::Request {
+            public_key: node.id.public_key,
+        }
+        .write(&mut w)?;
+        let _ = w.into_inner();
     }
-    .write(&mut wbuf.clone().writer())?;
-    stream.write_all(&wbuf).await?;
 
-    let mut rbuf = vec![0u8; 16 * 1024];
-    let n = stream.read(&mut rbuf).await?;
-    if n == 0 {
-        bail!("bootstrap: peer {peer} closed the connection");
+    let out = BytesMut::with_capacity(PacketHeader::SIZE + body.len());
+    {
+        let mut w = out.clone().writer();
+        PacketHeader {
+            len: body.len() as u32,
+            flags: 0,
+        }
+        .write(&mut w)?;
+        std::io::Write::write_all(&mut w, &body)?;
+        let _ = w.into_inner();
     }
-    let mut cur = &rbuf[..n];
 
-    let pkt = Packet::read(&mut cur)?;
+    stream.write_all(&out).await?;
+
+    let mut hdr = [0u8; PacketHeader::SIZE];
+    stream.read_exact(&mut hdr).await?;
+    let mut cur = std::io::Cursor::new(&hdr[..]);
+    let header = PacketHeader::read(&mut cur)?;
+
+    let mut body = vec![0u8; header.len as usize];
+    stream.read_exact(&mut body).await?;
+
+    let mut pkt_cur = std::io::Cursor::new(&body[..]);
+    let pkt = Packet::read(&mut pkt_cur)?;
     if pkt.op != Op::Response || pkt.tag != Tag::FindNodes {
-        bail!(
+        anyhow::bail!(
             "bootstrap: unexpected response from {peer}: op={:?} tag={:?}",
             pkt.op,
             pkt.tag
         );
     }
 
-    let rsp = find_node_frame::Response::read(&mut cur)?;
+    let mut tail = pkt_cur;
+    let rsp = net::frame::find_node_frame::Response::read(&mut tail)?;
 
     {
         let mut table = node.table.write().unwrap();
         for id in &rsp.peer_ids {
             match table.put(*id) {
-                PutResult::Full => {}
-                PutResult::Inserted => info!("bootstrap: added {}", id.address),
-                PutResult::Updated => info!("bootstrap: updated {}", id.address),
+                kademlia::PutResult::Full => {}
+                kademlia::PutResult::Inserted => log::info!("bootstrap: added {}", id.address),
+                kademlia::PutResult::Updated => log::info!("bootstrap: updated {}", id.address),
             }
         }
     }
@@ -129,6 +152,9 @@ async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
     let mut line = String::new();
     let stdin = io::stdin();
     loop {
+        print!(">>> ");
+        io::stdout().flush()?;
+
         line.clear();
         if stdin.lock().read_line(&mut line).is_err() {
             continue;
@@ -141,13 +167,13 @@ async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
             }
             "help" => {
                 println!("Commands");
-                println!("\thelp        Shows this menu");
-                println!("\tid          Prints the ID of the current node");
-                println!("\techo        Echoes a message to the terminal");
-                println!("\troute       Routes a packet to the specified node");
-                println!("\tpeers       Lists all nodes that the current node is connected to");
-                println!("\tbroadcast   Sends a message to all connected nodes");
-                println!("\texit        Terminate the current node and exit program");
+                println!("  help        Shows this menu");
+                println!("  id          Prints the ID of the current node");
+                println!("  echo        Echoes a message to the terminal");
+                println!("  route       Routes a packet to the specified node");
+                println!("  peers       Lists all nodes that the current node is connected to");
+                println!("  broadcast   Sends a message to all connected nodes");
+                println!("  exit        Terminate the current node and exit program");
             }
             cmd if cmd.starts_with("echo ") => {
                 let message = &cmd[5..];
@@ -156,7 +182,10 @@ async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
             "peers" => {
                 println!("Connected to {} peers", node.clients.lock().await.len());
                 for client in node.clients.lock().await.values() {
-                    println!("Connected to {:?}", client.lock().await.peer_id);
+                    println!(
+                        "  Connected to peer with id {:?}",
+                        client.lock().await.peer_id
+                    );
                 }
             }
             cmd if cmd.starts_with("route ") => {
@@ -171,6 +200,10 @@ async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
                 } else {
                     println!("no route");
                 }
+            }
+            "exit" => {
+                println!("Bye!");
+                std::process::exit(0);
             }
             _ => {}
         }
@@ -189,6 +222,8 @@ struct Node {
     processed_nonces: AsyncMutex<HashSet<[u8; 16]>>,
     routing: Routing,
 }
+
+const HEADER_SIZE: usize = PacketHeader::SIZE;
 
 impl Node {
     pub async fn bind(signer: SigningKey, address: SocketAddr) -> std::io::Result<Self> {
@@ -213,6 +248,34 @@ impl Node {
         })
     }
 
+    async fn send_hello(&self, client: &mut Client) -> std::io::Result<()> {
+        let mut local_nonce = [0u8; 16];
+        OsRng.fill_bytes(&mut local_nonce);
+
+        client.conn.set_signed(true);
+        client.conn.set_encrypted(false);
+
+        {
+            let mut w = client.writer().writer();
+            Packet {
+                op: Op::Request,
+                tag: Tag::Hello,
+            }
+            .write(&mut w)?;
+            frame::HelloFrame {
+                peer_id: self.id,
+                public_key: self.id.public_key,
+                nonce: local_nonce,
+            }
+            .write(&mut w)?;
+            let _ = w.into_inner();
+        }
+
+        client.flush().await?;
+
+        Ok(())
+    }
+
     pub async fn run_accept_loop(self: Arc<Self>) -> std::io::Result<()> {
         loop {
             let (stream, addr) = self.listener.accept().await?;
@@ -222,7 +285,7 @@ impl Node {
                 let (reader, writer) = stream.into_split();
 
                 if let Err(e) = me.register_client(addr, writer).await {
-                    error!("get_or_create_client error for {addr}: {e:?}");
+                    error!("register_client error for {addr}: {e:?}");
                     return;
                 }
 
@@ -244,15 +307,33 @@ impl Node {
             if n == 0 {
                 break;
             }
-            let mut cursor = &buf[..n];
 
-            while cursor.has_remaining() {
-                let pkt = Packet::read(&mut cursor)?;
-                let tail = &buf[(n - cursor.remaining())..n];
-                self.handle_node_packet(addr, pkt, tail).await?;
+            let mut i = 0;
+            while i + HEADER_SIZE <= n {
+                let mut hdr_cur = io::Cursor::new(&buf[i..i + HEADER_SIZE]);
+                let header = PacketHeader::read(&mut hdr_cur).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("bad header: {e}"))
+                })?;
+                let body_len = header.len as usize;
+                let frame_total = HEADER_SIZE + body_len;
+
+                if i + frame_total > n {
+                    break;
+                }
+
+                let body = &buf[i + HEADER_SIZE..i + frame_total];
+
+                let mut pkt_cur = io::Cursor::new(body);
+                let pkt = Packet::read(&mut pkt_cur).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("bad packet: {e}"))
+                })?;
+
+                let raw_tail = body;
+                self.handle_node_packet(addr, pkt, raw_tail).await?;
+
+                i += frame_total;
             }
         }
-
         Ok(())
     }
 
@@ -295,8 +376,10 @@ impl Node {
                 Tag::Hello => {
                     let mut rdr = io::Cursor::new(raw_tail);
                     let hello = frame::HelloFrame::read(&mut rdr).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "data incorrect")
+                        io::Error::new(io::ErrorKind::InvalidData, "bad hello frame")
                     })?;
+
+                    let signed_len = rdr.position() as usize;
 
                     // Read trailing signature
                     let sig_bytes = {
@@ -307,7 +390,7 @@ impl Node {
 
                     // Verify signature
                     let sig = Signature::from_bytes(&sig_bytes);
-                    let to_verify = &raw_tail[..raw_tail.len() - Signature::BYTE_SIZE];
+                    let to_verify = &raw_tail[..signed_len];
                     let peer_vk =
                         VerifyingKey::from_bytes(&hello.peer_id.public_key).map_err(|_| {
                             io::Error::new(io::ErrorKind::InvalidData, "invalid public key")
@@ -355,6 +438,7 @@ impl Node {
                             nonce: local_nonce,
                         }
                         .write(&mut w)?;
+                        let _ = w.into_inner();
                     }
 
                     client.flush().await?;
@@ -367,7 +451,7 @@ impl Node {
                         hello.nonce,
                     )
                     .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    .map_err(io::Error::other)?;
                 }
                 Tag::FindNodes => {
                     let mut rdr = io::Cursor::new(raw_tail);
@@ -440,34 +524,24 @@ impl Node {
     }
 
     async fn register_client(&self, addr: SocketAddr, writer: OwnedWriteHalf) -> io::Result<()> {
-        let mut map = self.clients.lock().await;
-        if !map.contains_key(&addr) {
-            let client = Arc::new(AsyncMutex::new(Client::new(
-                addr,
-                writer,
-                self.signer.clone(),
-            )));
-            map.insert(addr, client);
+        let client_arc = {
+            let mut map = self.clients.lock().await;
+            let entry = map.entry(addr).or_insert_with(|| {
+                Arc::new(AsyncMutex::new(Client::new(
+                    addr,
+                    writer,
+                    self.signer.clone(),
+                )))
+            });
+            entry.clone()
+        };
+
+        {
+            let mut client = client_arc.lock().await;
+            self.send_hello(&mut client).await?;
         }
 
         Ok(())
-    }
-
-    pub async fn get_or_create_client(
-        &mut self,
-        addr: SocketAddr,
-        writer: OwnedWriteHalf,
-    ) -> io::Result<Arc<AsyncMutex<Client>>> {
-        if let Some(c) = self.clients.lock().await.get(&addr) {
-            return Ok(c.clone());
-        }
-        let client = Arc::new(AsyncMutex::new(Client::new(
-            addr,
-            writer,
-            self.signer.clone(),
-        )));
-        self.clients.lock().await.insert(addr, client.clone());
-        Ok(client)
     }
 }
 
@@ -585,7 +659,7 @@ impl Connection {
             let mut session_guard = self
                 .session
                 .as_ref()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Missing session"))?
+                .ok_or_else(|| io::Error::other("Missing session"))?
                 .lock()
                 .await;
 
@@ -652,7 +726,7 @@ impl Connection {
     }
 }
 
-pub struct Routing {
+struct Routing {
     sessions: Mutex<HashMap<[u8; 32], Arc<AsyncMutex<Session>>>>,
 }
 
@@ -705,7 +779,7 @@ impl Routing {
         let session = match key_type {
             KeyType::KeyPair(kp) => Session::new(&[], key, kp),
             KeyType::RemoteKey(remote_key) => {
-                Session::init_remote_key((&[]).to_vec(), key, remote_key)
+                Session::init_remote_key([].to_vec(), key, remote_key)
             }
         };
 
