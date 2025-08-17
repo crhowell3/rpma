@@ -17,7 +17,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::io::{self, BufRead};
 use std::net::SocketAddr;
-use std::os::linux::raw;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -33,12 +32,12 @@ use crate::encryption::KeyPair;
 #[derive(Parser)]
 #[command(name = "rpma", version)]
 struct Args {
-    #[arg(long)]
+    #[arg(long, short('l'))]
     listen_addr: String,
-    #[arg(long)]
+    #[arg(long, short('i'))]
     interactive: bool,
     #[arg(trailing_var_arg = true)]
-    peer: Vec<String>,
+    peers: Vec<String>,
 }
 
 #[tokio::main]
@@ -63,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    for p in args.peer {
+    for p in args.peers {
         if let Ok(addr) = p.parse() {
             let n = node.clone();
             tokio::spawn(async move {
