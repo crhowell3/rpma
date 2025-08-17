@@ -1,22 +1,23 @@
-use anyhow::bail;
+#![warn(unused_extern_crates, unused_imports, unused_variables)]
+#![warn(dead_code)]
+
 use blake3::Hasher;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use clap::{Parser, arg};
 use ed25519_dalek::ed25519::signature::SignerMut;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use encryption::{Encrypted, Session};
+use env_logger::Env;
 use kademlia::{ID, PutResult, RoutingTable};
-use libc::QCMD;
 use log::{debug, error, info, warn};
 use net::frame::{self, find_node_frame};
 use net::packet::{EncryptionMetadata, Op, Packet, PacketHeader, Tag};
 use rand::RngCore;
-use rand::rngs::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::io::{self, BufRead};
 use std::net::SocketAddr;
-use std::process::ExitCode;
+use std::os::linux::raw;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -42,7 +43,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
 
@@ -57,16 +58,19 @@ async fn main() -> anyhow::Result<()> {
         let n = node.clone();
         tokio::spawn(async move {
             if let Err(e) = n.run_accept_loop().await {
-                eprintln!("Error in accept loop: {e:?}");
+                error!("Error in accept loop: {e:?}");
             }
         });
     }
 
     for p in args.peer {
         if let Ok(addr) = p.parse() {
-            if let Err(e) = bootstrap_node_with_peer(node.clone(), addr).await {
-                warn!("bootstrap failed: {e:#}");
-            }
+            let n = node.clone();
+            tokio::spawn(async move {
+                if let Err(e) = n.connect_and_register(addr).await {
+                    warn!("connect to {addr} failed: {e:?}");
+                }
+            });
         }
     }
 
@@ -76,74 +80,6 @@ async fn main() -> anyhow::Result<()> {
 
     futures::future::pending::<()>().await;
     #[allow(unreachable_code)]
-    Ok(())
-}
-
-async fn bootstrap_node_with_peer(node: Arc<Node>, peer: SocketAddr) -> anyhow::Result<()> {
-    let mut stream = TcpStream::connect(peer).await?;
-
-    let body = bytes::BytesMut::with_capacity(1024);
-    {
-        let mut w = body.clone().writer();
-        Packet {
-            op: Op::Request,
-            tag: Tag::FindNodes,
-        }
-        .write(&mut w)?;
-
-        net::frame::find_node_frame::Request {
-            public_key: node.id.public_key,
-        }
-        .write(&mut w)?;
-        let _ = w.into_inner();
-    }
-
-    let out = BytesMut::with_capacity(PacketHeader::SIZE + body.len());
-    {
-        let mut w = out.clone().writer();
-        PacketHeader {
-            len: body.len() as u32,
-            flags: 0,
-        }
-        .write(&mut w)?;
-        std::io::Write::write_all(&mut w, &body)?;
-        let _ = w.into_inner();
-    }
-
-    stream.write_all(&out).await?;
-
-    let mut hdr = [0u8; PacketHeader::SIZE];
-    stream.read_exact(&mut hdr).await?;
-    let mut cur = std::io::Cursor::new(&hdr[..]);
-    let header = PacketHeader::read(&mut cur)?;
-
-    let mut body = vec![0u8; header.len as usize];
-    stream.read_exact(&mut body).await?;
-
-    let mut pkt_cur = std::io::Cursor::new(&body[..]);
-    let pkt = Packet::read(&mut pkt_cur)?;
-    if pkt.op != Op::Response || pkt.tag != Tag::FindNodes {
-        anyhow::bail!(
-            "bootstrap: unexpected response from {peer}: op={:?} tag={:?}",
-            pkt.op,
-            pkt.tag
-        );
-    }
-
-    let mut tail = pkt_cur;
-    let rsp = net::frame::find_node_frame::Response::read(&mut tail)?;
-
-    {
-        let mut table = node.table.write().unwrap();
-        for id in &rsp.peer_ids {
-            match table.put(*id) {
-                kademlia::PutResult::Full => {}
-                kademlia::PutResult::Inserted => log::info!("bootstrap: added {}", id.address),
-                kademlia::PutResult::Updated => log::info!("bootstrap: updated {}", id.address),
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -162,13 +98,14 @@ async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
         let cmd = line.trim();
 
         match cmd {
-            "id" => {
-                println!("{}", node.id);
+            "id" | "whoami" => {
+                println!("Node ID: {}", node.id);
             }
             "help" => {
                 println!("Commands");
                 println!("  help        Shows this menu");
-                println!("  id          Prints the ID of the current node");
+                println!("  whoami      Prints the ID of the current node");
+                println!("  id          Alias for 'whoami'");
                 println!("  echo        Echoes a message to the terminal");
                 println!("  route       Routes a packet to the specified node");
                 println!("  peers       Lists all nodes that the current node is connected to");
@@ -180,12 +117,11 @@ async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
                 println!("{message}");
             }
             "peers" => {
-                println!("Connected to {} peers", node.clients.lock().await.len());
-                for client in node.clients.lock().await.values() {
-                    println!(
-                        "  Connected to peer with id {:?}",
-                        client.lock().await.peer_id
-                    );
+                let map = node.clients.lock().await;
+                println!("Connected to {} peers", map.len());
+                for client in map.values() {
+                    let c = client.lock().await;
+                    println!("  Connected to peer with id {}", c.peer_id.unwrap());
                 }
             }
             cmd if cmd.starts_with("route ") => {
@@ -249,8 +185,7 @@ impl Node {
     }
 
     async fn send_hello(&self, client: &mut Client) -> std::io::Result<()> {
-        let mut local_nonce = [0u8; 16];
-        OsRng.fill_bytes(&mut local_nonce);
+        let local_nonce = frame::random_nonce();
 
         client.conn.set_signed(true);
         client.conn.set_encrypted(false);
@@ -279,6 +214,7 @@ impl Node {
     pub async fn run_accept_loop(self: Arc<Self>) -> std::io::Result<()> {
         loop {
             let (stream, addr) = self.listener.accept().await?;
+            log::info!("accept: connection from {addr}");
             let me = std::sync::Arc::clone(&self);
 
             tokio::spawn(async move {
@@ -288,6 +224,8 @@ impl Node {
                     error!("register_client error for {addr}: {e:?}");
                     return;
                 }
+
+                log::info!("accept: registered {addr}, spawning read loop");
 
                 if let Err(e) = me.run_read_loop(reader, addr).await {
                     warn!("read loop error from {addr}: {e:?}");
@@ -302,6 +240,7 @@ impl Node {
         addr: SocketAddr,
     ) -> io::Result<()> {
         let mut buf = vec![0u8; 16 * 1024];
+
         loop {
             let n = reader.read(&mut buf).await?;
             if n == 0 {
@@ -328,7 +267,9 @@ impl Node {
                     io::Error::new(io::ErrorKind::InvalidData, format!("bad packet: {e}"))
                 })?;
 
-                let raw_tail = body;
+                let tail_start = pkt_cur.position() as usize;
+                let raw_tail = &body[tail_start..];
+
                 self.handle_node_packet(addr, pkt, raw_tail).await?;
 
                 i += frame_total;
@@ -382,22 +323,31 @@ impl Node {
                     let signed_len = rdr.position() as usize;
 
                     // Read trailing signature
-                    let sig_bytes = {
-                        let mut s = [0u8; Signature::BYTE_SIZE];
-                        std::io::Read::read_exact(&mut rdr, &mut s)?;
-                        s
-                    };
+                    let mut sig_bytes = [0u8; Signature::BYTE_SIZE];
+                    io::Read::read_exact(&mut rdr, &mut sig_bytes)?;
+                    let sig = Signature::from_bytes(&sig_bytes);
+
+                    let mut prefix = Vec::with_capacity(2);
+                    Packet {
+                        op: packet.op,
+                        tag: packet.tag,
+                    }
+                    .write(&mut prefix)?;
+
+                    let mut to_verify_buffer = Vec::with_capacity(2 + signed_len);
+                    to_verify_buffer.extend_from_slice(&prefix);
+                    to_verify_buffer.extend_from_slice(&raw_tail[..signed_len]);
 
                     // Verify signature
-                    let sig = Signature::from_bytes(&sig_bytes);
-                    let to_verify = &raw_tail[..signed_len];
                     let peer_vk =
                         VerifyingKey::from_bytes(&hello.peer_id.public_key).map_err(|_| {
                             io::Error::new(io::ErrorKind::InvalidData, "invalid public key")
                         })?;
-                    peer_vk.verify_strict(to_verify, &sig).map_err(|_| {
-                        io::Error::new(io::ErrorKind::PermissionDenied, "bad hello signature")
-                    })?;
+                    peer_vk
+                        .verify_strict(&to_verify_buffer, &sig)
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::PermissionDenied, "bad hello signature")
+                        })?;
 
                     {
                         let mut table = self.table.write().unwrap();
@@ -418,8 +368,7 @@ impl Node {
                     let mut client = client_arc.lock().await;
                     client.peer_id = Some(hello.peer_id);
 
-                    let mut local_nonce = [0u8; 16];
-                    rand::thread_rng().fill_bytes(&mut local_nonce);
+                    let local_nonce = frame::random_nonce();
 
                     client.conn.set_signed(true);
                     client.conn.set_encrypted(false);
@@ -493,7 +442,84 @@ impl Node {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "Unexpected tag"));
                 }
             },
+            Op::Response => match packet.tag {
+                Tag::Hello => {
+                    let mut rdr = io::Cursor::new(raw_tail);
 
+                    let hello = frame::HelloFrame::read(&mut rdr).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "bad hello frame")
+                    })?;
+
+                    let mut sig_bytes = [0u8; Signature::BYTE_SIZE];
+                    io::Read::read_exact(&mut rdr, &mut sig_bytes)?;
+                    let sig = Signature::from_bytes(&sig_bytes);
+
+                    let sig_len = Signature::BYTE_SIZE;
+                    let hello_payload = &raw_tail[..raw_tail.len() - sig_len];
+
+                    let mut prefix = [0u8; 2];
+                    {
+                        let mut v = Vec::with_capacity(2);
+                        Packet {
+                            op: Op::Response,
+                            tag: Tag::Hello,
+                        }
+                        .write(&mut v)?;
+                        prefix.copy_from_slice(&v[..2]);
+                    }
+
+                    let mut to_verify_buffer = Vec::with_capacity(2 + hello_payload.len());
+                    to_verify_buffer.extend_from_slice(&prefix);
+                    to_verify_buffer.extend_from_slice(hello_payload);
+
+                    let peer_vk =
+                        VerifyingKey::from_bytes(&hello.peer_id.public_key).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid public key")
+                        })?;
+                    peer_vk
+                        .verify_strict(&to_verify_buffer, &sig)
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "bad hello signature {resp}",
+                            )
+                        })?;
+
+                    {
+                        let mut table = self.table.write().unwrap();
+                        match table.put(hello.peer_id) {
+                            PutResult::Full => info!(""),
+                            PutResult::Updated => info!(""),
+                            PutResult::Inserted => info!(""),
+                        }
+                    }
+
+                    let client_arc = {
+                        let map = self.clients.lock().await;
+                        map.get(&client_addr).cloned().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "client not found")
+                        })?
+                    };
+
+                    let mut client = client_arc.lock().await;
+                    client.peer_id = Some(hello.peer_id);
+
+                    self.configure_peer_after_hello(
+                        &mut client,
+                        hello.peer_id,
+                        hello.public_key,
+                        [0u8; 16],
+                        hello.nonce,
+                    )
+                    .await?;
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unexpected tag for Op::Response",
+                    ));
+                }
+            },
             Op::Command => {
                 match packet.tag {
                     Tag::Route => {
@@ -513,27 +539,44 @@ impl Node {
                     }
                 }
             }
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Unexpected op",
-                ));
-            }
         }
+        Ok(())
+    }
+
+    pub async fn connect_and_register(self: &Arc<Self>, addr: SocketAddr) -> io::Result<()> {
+        log::info!("dial: connecting to {addr}");
+        let stream = TcpStream::connect(addr).await?;
+        let (reader, writer) = stream.into_split();
+
+        self.register_client(addr, writer).await?;
+        log::info!("dial: registered {addr}, spawning read loop");
+
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = me.run_read_loop(reader, addr).await {
+                warn!("read loop error from {addr}: {e:?}");
+            }
+        });
+
         Ok(())
     }
 
     async fn register_client(&self, addr: SocketAddr, writer: OwnedWriteHalf) -> io::Result<()> {
         let client_arc = {
             let mut map = self.clients.lock().await;
-            let entry = map.entry(addr).or_insert_with(|| {
-                Arc::new(AsyncMutex::new(Client::new(
-                    addr,
-                    writer,
-                    self.signer.clone(),
-                )))
-            });
-            entry.clone()
+            let entry = map
+                .entry(addr)
+                .or_insert_with(|| {
+                    Arc::new(AsyncMutex::new(Client::new(
+                        addr,
+                        writer,
+                        self.signer.clone(),
+                    )))
+                })
+                .clone();
+            let count = map.len();
+            log::info!("register_client: inserted/exists for {addr}. clients.len()={count}");
+            entry
         };
 
         {
