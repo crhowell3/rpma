@@ -110,6 +110,7 @@ impl EncryptionMetadata {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
         let mut dh = [0u8; 32];
         reader.read_exact(&mut dh)?;

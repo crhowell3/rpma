@@ -36,13 +36,13 @@ struct Args {
     listen_addr: String,
     #[arg(long, short('i'))]
     interactive: bool,
-    #[arg(trailing_var_arg = true)]
+    #[arg(long, short('p'))]
     peers: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
 
     let args = Args::parse();
 
@@ -136,6 +136,11 @@ async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
                     println!("no route");
                 }
             }
+            cmd if cmd.starts_with("broadcast ") => {
+                let message = &cmd.as_bytes()["broadcast ".len()..];
+                node.broadcast_to_connected(message, 4).await;
+                println!("broadcast enqueued to connected peers");
+            }
             "exit" => {
                 println!("Bye!");
                 std::process::exit(0);
@@ -147,9 +152,11 @@ async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
 
 struct Node {
     id: ID,
+    #[allow(dead_code)]
     address: SocketAddr,
     listener: TcpListener,
     signer: SigningKey,
+    #[allow(dead_code)]
     verifier: VerifyingKey,
     keys: Arc<KeyPair>,
     table: RwLock<RoutingTable>,
@@ -233,23 +240,66 @@ impl Node {
         }
     }
 
+    async fn broadcast_to_connected(&self, msg: &[u8], ttl: u8) {
+        // make a nonce
+        let mut nonce = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+        let b = net::frame::BroadcastFrame {
+            src: self.id.public_key,
+            nonce,
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i128,
+            n: ttl,
+        };
+
+        let map = self.clients.lock().await;
+        for (addr, client_arc) in map.iter() {
+            let mut client = client_arc.lock().await;
+            client.conn.set_encrypted(false);
+            client.conn.set_signed(true);
+
+            let mut w = client.writer().writer();
+            if let Err(e) = (|| -> std::io::Result<()> {
+                Packet {
+                    op: Op::Command,
+                    tag: Tag::Broadcast,
+                }
+                .write(&mut w)?;
+                b.write(&mut w)?;
+                io::Write::write_all(&mut w, msg)?;
+                Ok(())
+            })() {
+                log::debug!("broadcast: build {} failed: {e:?}", addr);
+                continue;
+            }
+            let _ = w.into_inner();
+
+            if let Err(e) = client.flush().await {
+                log::debug!("broadcast: flush {} failed: {e:?}", addr);
+            }
+        }
+    }
+
     pub async fn run_read_loop(
         self: Arc<Self>,
         mut reader: OwnedReadHalf,
         addr: SocketAddr,
     ) -> io::Result<()> {
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut buffer = vec![0u8; 16 * 1024];
 
         loop {
-            let n = reader.read(&mut buf).await?;
+            let n = reader.read(&mut buffer).await?;
             if n == 0 {
                 break;
             }
 
             let mut i = 0;
             while i + HEADER_SIZE <= n {
-                let mut hdr_cur = io::Cursor::new(&buf[i..i + HEADER_SIZE]);
-                let header = PacketHeader::read(&mut hdr_cur).map_err(|e| {
+                let mut header_cursor = io::Cursor::new(&buffer[i..i + HEADER_SIZE]);
+                let header = PacketHeader::read(&mut header_cursor).map_err(|e| {
                     io::Error::new(io::ErrorKind::InvalidData, format!("bad header: {e}"))
                 })?;
                 let body_len = header.len as usize;
@@ -259,7 +309,7 @@ impl Node {
                     break;
                 }
 
-                let body = &buf[i + HEADER_SIZE..i + frame_total];
+                let body = &buffer[i + HEADER_SIZE..i + frame_total];
 
                 let mut pkt_cur = io::Cursor::new(body);
                 let pkt = Packet::read(&mut pkt_cur).map_err(|e| {
@@ -314,16 +364,16 @@ impl Node {
         match packet.op {
             Op::Request => match packet.tag {
                 Tag::Hello => {
-                    let mut rdr = io::Cursor::new(raw_tail);
-                    let hello = frame::HelloFrame::read(&mut rdr).map_err(|_| {
+                    let mut cursor = io::Cursor::new(raw_tail);
+                    let hello = frame::HelloFrame::read(&mut cursor).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidData, "bad hello frame")
                     })?;
 
-                    let signed_len = rdr.position() as usize;
+                    let signed_len = cursor.position() as usize;
 
                     // Read trailing signature
                     let mut sig_bytes = [0u8; Signature::BYTE_SIZE];
-                    io::Read::read_exact(&mut rdr, &mut sig_bytes)?;
+                    io::Read::read_exact(&mut cursor, &mut sig_bytes)?;
                     let sig = Signature::from_bytes(&sig_bytes);
 
                     let mut prefix = Vec::with_capacity(2);
@@ -402,8 +452,8 @@ impl Node {
                     .map_err(io::Error::other)?;
                 }
                 Tag::FindNodes => {
-                    let mut rdr = io::Cursor::new(raw_tail);
-                    let q = find_node_frame::Request::read(&mut rdr).map_err(|e| {
+                    let mut cursor = io::Cursor::new(raw_tail);
+                    let q = find_node_frame::Request::read(&mut cursor).map_err(|e| {
                         io::Error::new(io::ErrorKind::InvalidData, format!("bad FindNodes: {e}"))
                     })?;
 
@@ -443,14 +493,14 @@ impl Node {
             },
             Op::Response => match packet.tag {
                 Tag::Hello => {
-                    let mut rdr = io::Cursor::new(raw_tail);
+                    let mut cursor = io::Cursor::new(raw_tail);
 
-                    let hello = frame::HelloFrame::read(&mut rdr).map_err(|_| {
+                    let hello = frame::HelloFrame::read(&mut cursor).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidData, "bad hello frame")
                     })?;
 
                     let mut sig_bytes = [0u8; Signature::BYTE_SIZE];
-                    io::Read::read_exact(&mut rdr, &mut sig_bytes)?;
+                    io::Read::read_exact(&mut cursor, &mut sig_bytes)?;
                     let sig = Signature::from_bytes(&sig_bytes);
 
                     let sig_len = Signature::BYTE_SIZE;
@@ -525,10 +575,87 @@ impl Node {
                         // NOOP
                     }
                     Tag::Echo => {
-                        // NOOP
+                        let mut cursor = io::Cursor::new(raw_tail);
+                        let echo = frame::EchoFrame::read(&mut cursor).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "bad echo frame")
+                        })?;
+
+                        match std::str::from_utf8(&echo.txt) {
+                            Ok(s) => info!("echo: \"{s}\""),
+                            Err(_) => error!("echo: {:02x?}", &echo.txt),
+                        }
                     }
                     Tag::Broadcast => {
-                        // NOOP
+                        let mut cursor = io::Cursor::new(raw_tail);
+                        let frame = frame::BroadcastFrame::read(&mut cursor).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "bad broadcast frame")
+                        })?;
+                        let pos = cursor.position() as usize;
+                        let payload = &raw_tail[pos..];
+
+                        if frame.n == 5 {
+                            debug!(
+                                "processing broadcast {} (ignored: n = 5)",
+                                hex::encode(frame.nonce)
+                            );
+                            return Ok(());
+                        }
+
+                        {
+                            let mut seen = self.processed_nonces.lock().await;
+                            if !seen.insert(frame.nonce) {
+                                debug!(
+                                    "processing broadcast {} (ignored: processed)",
+                                    hex::encode(frame.nonce)
+                                );
+                                return Ok(());
+                            }
+                        }
+
+                        match String::from_utf8(payload.to_vec()) {
+                            Ok(s) => {
+                                println!(
+                                    "broadcast from {:x?} (ttl={}): \"{}\"",
+                                    hex::encode(&frame.src[..8]),
+                                    frame.n,
+                                    s
+                                );
+                            }
+                            Err(_) => {
+                                println!(
+                                    "broadcast from {:x?} (ttl={}): {:?} bytes",
+                                    hex::encode(&frame.src[..8]),
+                                    frame.n,
+                                    payload.len()
+                                );
+                            }
+                        }
+
+                        if frame.n > 0 {
+                            let mut next_b = frame;
+                            next_b.n -= 1;
+
+                            let map = self.clients.lock().await;
+                            for (addr, client_arc) in map.iter() {
+                                let mut client = client_arc.lock().await;
+                                client.conn.set_encrypted(false);
+                                client.conn.set_signed(true);
+
+                                let mut w = client.writer().writer();
+                                Packet {
+                                    op: Op::Command,
+                                    tag: Tag::Broadcast,
+                                }
+                                .write(&mut w)?;
+                                next_b.write(&mut w)?;
+                                std::io::Write::write_all(&mut w, payload)?;
+                                let _ = w.into_inner();
+
+                                if let Err(e) = client.flush().await {
+                                    log::debug!("broadcast: flush {} failed: {e:?}", addr);
+                                }
+                            }
+                        }
                     }
                     _ => {
                         return Err(std::io::Error::new(
@@ -588,10 +715,13 @@ impl Node {
 }
 
 struct Client {
+    #[allow(dead_code)]
     address: SocketAddr,
+    #[allow(dead_code)]
     writer: Arc<AsyncMutex<OwnedWriteHalf>>,
     conn: Connection,
     peer_id: Option<ID>,
+    #[allow(dead_code)]
     read_notify: Arc<tokio::sync::Notify>,
 }
 
@@ -629,9 +759,6 @@ pub enum KeyType {
     KeyPair(KeyPair),
 }
 
-const FLAG_SIGNED: u8 = 0x1;
-const FLAG_ENCRYPTED: u8 = 0x2;
-
 pub enum Backend {
     Socket(Arc<AsyncMutex<OwnedWriteHalf>>),
     Buffer(Arc<Mutex<BytesMut>>),
@@ -646,26 +773,6 @@ struct Connection {
 }
 
 impl Connection {
-    fn new_socket(writer: Arc<AsyncMutex<OwnedWriteHalf>>, node_signer: SigningKey) -> Self {
-        Self {
-            write_buffer: BytesMut::with_capacity(2048),
-            backend: Backend::Socket(writer),
-            flags: 0,
-            node_signer,
-            session: None,
-        }
-    }
-
-    fn new_nested(parent_buf: Arc<Mutex<BytesMut>>, node_signer: SigningKey) -> Self {
-        Self {
-            write_buffer: BytesMut::with_capacity(2048),
-            backend: Backend::Buffer(parent_buf),
-            flags: 0,
-            node_signer,
-            session: None,
-        }
-    }
-
     pub fn writer(&mut self) -> &mut BytesMut {
         &mut self.write_buffer
     }
