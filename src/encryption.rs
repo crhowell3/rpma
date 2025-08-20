@@ -39,14 +39,17 @@ impl KeyPair {
     }
 }
 
+#[allow(dead_code)]
 pub fn init(id: &[u8], shared_key: [u8; 32], keys: KeyPair) -> Session {
     Session::new(id, shared_key, keys)
 }
 
+#[allow(dead_code)]
 pub fn init_remote_key(id: &[u8], shared_key: [u8; 32], remote_key: [u8; 32]) -> Session {
     Session::init_remote_key(id.to_vec(), shared_key, remote_key)
 }
 
+#[allow(dead_code)]
 pub fn random_id() -> [u8; 16] {
     let mut id = [0u8; 16];
     OsRng.fill_bytes(&mut id);
@@ -178,6 +181,7 @@ fn _decrypt(mk: [u8; 32], in_key: &[u8], ad: &[u8]) -> Result<Vec<u8>, CryptoErr
 #[derive(Debug, Clone)]
 struct ChainLink {
     chain: Chain,
+    #[allow(dead_code)]
     nhk: [u8; 32],
 }
 
@@ -221,6 +225,7 @@ impl Chain {
 
 #[derive(Debug)]
 pub enum CryptoError {
+    #[allow(dead_code)]
     InvalidKey,
     SignatureMismatch,
 }
@@ -248,8 +253,11 @@ struct State {
     pn: u32,
     mk_skipped: KeyStorage,
     max_skip: u32,
+    #[allow(dead_code)]
     max_keep: u32,
+    #[allow(dead_code)]
     max_message_keys_per_session: u32,
+    #[allow(dead_code)]
     step: u32,
     keys_count: u32,
 }
@@ -320,8 +328,10 @@ impl State {
 
 #[derive(Clone, Debug)]
 struct Entry {
+    #[allow(dead_code)]
     session_id: Vec<u8>,
     message_key: [u8; 32],
+    #[allow(dead_code)]
     seq_num: u32,
 }
 
@@ -438,6 +448,7 @@ impl Session {
         }
     }
 
+    #[allow(dead_code)]
     pub fn decrypt(&mut self, message: Encrypted) -> Vec<u8> {
         let ad = (Header {
             dh: message.dh,

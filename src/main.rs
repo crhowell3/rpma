@@ -152,9 +152,11 @@ async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
 
 struct Node {
     id: ID,
+    #[allow(dead_code)]
     address: SocketAddr,
     listener: TcpListener,
     signer: SigningKey,
+    #[allow(dead_code)]
     verifier: VerifyingKey,
     keys: Arc<KeyPair>,
     table: RwLock<RoutingTable>,
@@ -713,10 +715,13 @@ impl Node {
 }
 
 struct Client {
+    #[allow(dead_code)]
     address: SocketAddr,
+    #[allow(dead_code)]
     writer: Arc<AsyncMutex<OwnedWriteHalf>>,
     conn: Connection,
     peer_id: Option<ID>,
+    #[allow(dead_code)]
     read_notify: Arc<tokio::sync::Notify>,
 }
 
@@ -754,9 +759,6 @@ pub enum KeyType {
     KeyPair(KeyPair),
 }
 
-const FLAG_SIGNED: u8 = 0x1;
-const FLAG_ENCRYPTED: u8 = 0x2;
-
 pub enum Backend {
     Socket(Arc<AsyncMutex<OwnedWriteHalf>>),
     Buffer(Arc<Mutex<BytesMut>>),
@@ -771,26 +773,6 @@ struct Connection {
 }
 
 impl Connection {
-    fn new_socket(writer: Arc<AsyncMutex<OwnedWriteHalf>>, node_signer: SigningKey) -> Self {
-        Self {
-            write_buffer: BytesMut::with_capacity(2048),
-            backend: Backend::Socket(writer),
-            flags: 0,
-            node_signer,
-            session: None,
-        }
-    }
-
-    fn new_nested(parent_buf: Arc<Mutex<BytesMut>>, node_signer: SigningKey) -> Self {
-        Self {
-            write_buffer: BytesMut::with_capacity(2048),
-            backend: Backend::Buffer(parent_buf),
-            flags: 0,
-            node_signer,
-            session: None,
-        }
-    }
-
     pub fn writer(&mut self) -> &mut BytesMut {
         &mut self.write_buffer
     }

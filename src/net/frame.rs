@@ -50,6 +50,7 @@ pub mod find_node_frame {
     }
 
     impl Request {
+        #[allow(dead_code)]
         pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
             writer.write_all(&self.public_key)?;
             Ok(())
@@ -76,6 +77,7 @@ pub mod find_node_frame {
             Ok(())
         }
 
+        #[allow(dead_code)]
         pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
             let mut len_buf = [0u8; 1];
             reader.read_exact(&mut len_buf)?;
@@ -91,6 +93,7 @@ pub mod find_node_frame {
     }
 }
 
+#[allow(dead_code)]
 pub struct RouteFrame {
     pub src: [u8; 32],
     pub dst: [u8; 32],
@@ -98,6 +101,7 @@ pub struct RouteFrame {
 }
 
 impl RouteFrame {
+    #[allow(dead_code)]
     pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&self.src)?;
         writer.write_all(&self.dst)?;
@@ -108,6 +112,7 @@ impl RouteFrame {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut src = [0u8; 32];
         reader.read_exact(&mut src)?;
@@ -145,6 +150,7 @@ pub struct EchoFrame {
 }
 
 impl EchoFrame {
+    #[allow(dead_code)]
     pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&(self.txt.len() as u64).to_le_bytes())?;
         writer.write_all(&self.txt)?;
@@ -204,6 +210,7 @@ pub fn random_nonce() -> [u8; 16] {
     buf
 }
 
+#[allow(dead_code)]
 fn invalid_data<E>(e: E) -> io::Error
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -211,6 +218,7 @@ where
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
+#[allow(dead_code)]
 pub async fn read_frame(reader: &mut OwnedReadHalf, client: &mut Client) -> io::Result<Vec<u8>> {
     const HEADER_SIZE: usize = 5;
     let mut header_bytes = [0u8; 5];

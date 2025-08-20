@@ -19,6 +19,7 @@ impl ID {
         }
     }
 
+    #[allow(dead_code)]
     fn size(&self) -> u32 {
         let ip_size = match self.address {
             SocketAddr::V4(_) => 4,
@@ -97,6 +98,7 @@ impl ID {
         })
     }
 
+    #[allow(dead_code)]
     pub fn eql(&self, other: &ID) -> bool {
         self.public_key == other.public_key && self.address == other.address
     }
@@ -130,6 +132,7 @@ pub enum PutResult {
 }
 
 pub enum BinarySearchResult {
+    #[allow(dead_code)]
     Found(usize),
     NotFound(usize),
 }
@@ -191,6 +194,7 @@ impl RoutingTable {
         }
     }
 
+    #[allow(dead_code)]
     pub fn delete(&mut self, public_key: &[u8; 32]) -> bool {
         if self.len == 0 || &self.public_key == public_key {
             return false;
@@ -350,6 +354,7 @@ where
         (counter.into() & ((CAPACITY as u64) - 1)) as usize
     }
 
+    #[allow(dead_code)]
     pub fn push_or_null(&mut self, item: T) -> Option<T> {
         let evicted = if self.count() == CAPACITY {
             Some(self.pop())
@@ -368,6 +373,7 @@ where
         self.head += 1;
     }
 
+    #[allow(dead_code)]
     pub fn push_one(&mut self) -> &mut Option<T> {
         assert!(self.count() < CAPACITY);
         let index = self.mask_index(self.head);
@@ -375,6 +381,7 @@ where
         &mut self.entries[index]
     }
 
+    #[allow(dead_code)]
     pub fn prepend(&mut self, item: T) {
         assert!(self.count() < CAPACITY);
         self.tail -= 1;
@@ -398,6 +405,7 @@ where
         item
     }
 
+    #[allow(dead_code)]
     pub fn get(&self, i: Counter) -> Option<T> {
         if i < self.tail || i >= self.head {
             None
@@ -411,6 +419,7 @@ where
         (self.head.into() as isize - self.tail.into() as isize) as usize
     }
 
+    #[allow(dead_code)]
     pub fn latest(&self) -> Option<T> {
         if self.count() == 0 {
             None
@@ -420,6 +429,7 @@ where
         }
     }
 
+    #[allow(dead_code)]
     pub fn oldest(&self) -> Option<T> {
         if self.count() == 0 {
             None
