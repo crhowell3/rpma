@@ -13,21 +13,47 @@ use log::{debug, error, info, warn};
 use net::frame::{self, find_node_frame};
 use net::packet::{EncryptionMetadata, Op, Packet, PacketHeader, Tag};
 use rand::RngCore;
+use rustyline::{Editor, error::ReadlineError};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::io::{self, BufRead};
+use std::io::{self};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
 
 mod encryption;
 mod kademlia;
 mod net;
 
 use crate::encryption::KeyPair;
+use once_cell::sync::OnceCell;
+static LOG_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<String>> = OnceCell::new();
+
+struct ChannelLogger;
+
+impl log::Log for ChannelLogger {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        // Suppress rustyline debug logs
+        if record.level() == log::Level::Debug && record.target().starts_with("rustyline") {
+            return;
+        }
+        if let Some(tx) = LOG_TX.get() {
+            let msg = format!("[{}] {}", record.level(), record.args());
+            let _ = tx.send(msg);
+        }
+    }
+    fn flush(&self) {}
+}
 
 #[derive(Parser)]
 #[command(name = "rpma", version)]
@@ -42,8 +68,6 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
-
     let args = Args::parse();
 
     let listen_addr: SocketAddr = args.listen_addr.parse()?;
@@ -74,7 +98,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if args.interactive {
-        open_tty(node.clone()).await?;
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        LOG_TX.set(tx.clone()).ok();
+        log::set_boxed_logger(Box::new(ChannelLogger)).unwrap();
+        log::set_max_level(log::LevelFilter::Debug);
+        open_tty(node.clone(), tx, rx).await?;
+    } else {
+        env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
+        let (dummy_tx, dummy_rx) = mpsc::unbounded_channel::<String>();
+        open_tty(node.clone(), dummy_tx, dummy_rx).await?;
     }
 
     futures::future::pending::<()>().await;
@@ -82,70 +114,116 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn open_tty(node: Arc<Node>) -> std::io::Result<()> {
+async fn open_tty(
+    node: Arc<Node>,
+    tx: mpsc::UnboundedSender<String>,
+    mut rx: mpsc::UnboundedReceiver<String>,
+) -> std::io::Result<()> {
+    let mut rl = Editor::<(), rustyline::history::MemHistory>::with_history(
+        rustyline::Config::default(),
+        rustyline::history::MemHistory::new(),
+    )
+    .unwrap();
     println!("Opening interactive tty...");
-    let mut line = String::new();
-    let stdin = io::stdin();
+
     loop {
-        print!(">>> ");
-        io::stdout().flush()?;
-
-        line.clear();
-        if stdin.lock().read_line(&mut line).is_err() {
-            continue;
+        // Print any pending output before showing prompt
+        while let Ok(msg) = rx.try_recv() {
+            println!("\x1b[1;34m[OUT]\x1b[0m {}", msg); // Blue color for output
         }
-        let cmd = line.trim();
 
-        match cmd {
-            "id" | "whoami" => {
-                println!("Node ID: {}", node.id);
-            }
-            "help" => {
-                println!("Commands");
-                println!("  help        Shows this menu");
-                println!("  whoami      Prints the ID of the current node");
-                println!("  id          Alias for 'whoami'");
-                println!("  echo        Echoes a message to the terminal");
-                println!("  route       Routes a packet to the specified node");
-                println!("  peers       Lists all nodes that the current node is connected to");
-                println!("  broadcast   Sends a message to all connected nodes");
-                println!("  exit        Terminate the current node and exit program");
-            }
-            cmd if cmd.starts_with("echo ") => {
-                let message = &cmd[5..];
-                println!("{message}");
-            }
-            "peers" => {
-                let map = node.clients.lock().await;
-                println!("Connected to {} peers", map.len());
-                for client in map.values() {
-                    let c = client.lock().await;
-                    println!("  Connected to peer with id {}", c.peer_id.unwrap());
+        let readline = rl.readline("\x1b[1;32m>>> "); // Green prompt
+        match readline {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+                let cmd = line.trim();
+                match cmd {
+                    "id" | "whoami" => {
+                        tx.send(format!("Node ID: {}", node.id)).unwrap();
+                    }
+                    "help" => {
+                        tx.send("Commands".to_string()).unwrap();
+                        tx.send("  help        Shows this menu".to_string())
+                            .unwrap();
+                        tx.send("  whoami      Prints the ID of the current node".to_string())
+                            .unwrap();
+                        tx.send("  id          Alias for 'whoami'".to_string())
+                            .unwrap();
+                        tx.send("  echo        Echoes a message to the terminal".to_string())
+                            .unwrap();
+                        tx.send("  route       Routes a packet to the specified node".to_string())
+                            .unwrap();
+                        tx.send(
+                            "  peers       Lists all nodes that the current node is connected to"
+                                .to_string(),
+                        )
+                        .unwrap();
+                        tx.send("  broadcast   Sends a message to all connected nodes".to_string())
+                            .unwrap();
+                        tx.send(
+                            "  exit        Terminate the current node and exit program".to_string(),
+                        )
+                        .unwrap();
+                    }
+                    cmd if cmd.starts_with("echo ") => {
+                        let message = &cmd[5..];
+                        tx.send(message.to_string()).unwrap();
+                    }
+                    "peers" => {
+                        let map = node.clients.lock().await;
+                        tx.send(format!("Connected to {} peers", map.len()))
+                            .unwrap();
+                        for client in map.values() {
+                            let c = client.lock().await;
+                            tx.send(format!(
+                                "  Connected to peer with id {}",
+                                c.peer_id.unwrap()
+                            ))
+                            .unwrap();
+                        }
+                    }
+                    cmd if cmd.starts_with("route ") => {
+                        let dst_hex = cmd.split_whitespace().nth(1).unwrap_or_default();
+                        if dst_hex.len() != 64 {
+                            tx.send("need 32-byte hex public key".to_string()).unwrap();
+                            continue;
+                        }
+                        let dst = [0u8; 32];
+                        if let Some(next) = Routing::next_hop(&node, node.id.public_key, dst, &[]) {
+                            tx.send(format!(
+                                "next hop: {} -> {}",
+                                hex::encode(dst),
+                                next.address
+                            ))
+                            .unwrap();
+                        } else {
+                            tx.send("no route".to_string()).unwrap();
+                        }
+                    }
+                    cmd if cmd.starts_with("broadcast ") => {
+                        let message = &cmd.as_bytes()["broadcast ".len()..];
+                        node.broadcast_to_connected(message, 4).await;
+                        tx.send("broadcast enqueued to connected peers".to_string())
+                            .unwrap();
+                    }
+                    "exit" => {
+                        tx.send("Bye!".to_string()).unwrap();
+                        std::process::exit(0);
+                    }
+                    _ => {}
                 }
             }
-            cmd if cmd.starts_with("route ") => {
-                let dst_hex = cmd.split_whitespace().nth(1).unwrap_or_default();
-                if dst_hex.len() != 64 {
-                    println!("need 32-byte hex public key");
-                    continue;
-                }
-                let dst = [0u8; 32];
-                if let Some(next) = Routing::next_hop(&node, node.id.public_key, dst, &[]) {
-                    println!("next hop: {} -> {}", hex::encode(dst), next.address);
-                } else {
-                    println!("no route");
-                }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                tx.send("Bye!".to_string()).unwrap();
+                return Ok(());
             }
-            cmd if cmd.starts_with("broadcast ") => {
-                let message = &cmd.as_bytes()["broadcast ".len()..];
-                node.broadcast_to_connected(message, 4).await;
-                println!("broadcast enqueued to connected peers");
+            Err(err) => {
+                tx.send(format!("Error: {:?}", err)).unwrap();
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ));
             }
-            "exit" => {
-                println!("Bye!");
-                std::process::exit(0);
-            }
-            _ => {}
         }
     }
 }
@@ -256,7 +334,7 @@ impl Node {
         };
         log::debug!(
             "broadcast SEND: nonce={} ttl={} msg_bytes={:?}",
-            hex::encode(&nonce),
+            hex::encode(nonce),
             ttl,
             msg
         );
@@ -927,20 +1005,20 @@ impl Routing {
 
         let mut candidates: [ID; 16] = [ID::default(); 16];
         let len = node.table.read().unwrap().closest_to(&mut candidates, &dst);
-        for i in 0..len {
+        for candidate in candidates[..len].iter() {
             let mut ok = true;
             for prev in prev_hops {
                 if prev.public_key == src {
                     continue;
                 }
 
-                if prev == &candidates[i] {
+                if prev == candidate {
                     ok = false;
                     break;
                 }
             }
             if ok {
-                return Some(candidates[i]);
+                return Some(*candidate);
             }
         }
 
