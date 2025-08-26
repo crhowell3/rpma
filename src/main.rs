@@ -254,6 +254,12 @@ impl Node {
                 .as_millis() as i128,
             n: ttl,
         };
+        log::debug!(
+            "broadcast SEND: nonce={} ttl={} msg_bytes={:?}",
+            hex::encode(&nonce),
+            ttl,
+            msg
+        );
 
         let map = self.clients.lock().await;
         for (addr, client_arc) in map.iter() {
@@ -269,7 +275,10 @@ impl Node {
                 }
                 .write(&mut w)?;
                 b.write(&mut w)?;
-                io::Write::write_all(&mut w, msg)?;
+                // Write 2-byte length prefix (big-endian)
+                let msg_len = msg.len() as u16;
+                w.write_all(&msg_len.to_be_bytes())?;
+                w.write_all(msg)?;
                 Ok(())
             })() {
                 log::debug!("broadcast: build {} failed: {e:?}", addr);
@@ -429,7 +438,6 @@ impl Node {
                             tag: Tag::Hello,
                         }
                         .write(&mut w)?;
-
                         frame::HelloFrame {
                             peer_id: self.id,
                             public_key: self.id.public_key,
@@ -595,8 +603,9 @@ impl Node {
 
                         if frame.n == 5 {
                             debug!(
-                                "processing broadcast {} (ignored: n = 5)",
-                                hex::encode(frame.nonce)
+                                "broadcast IGNORED: nonce={} ttl={} reason=n==5",
+                                hex::encode(frame.nonce),
+                                frame.n
                             );
                             return Ok(());
                         }
@@ -605,29 +614,47 @@ impl Node {
                             let mut seen = self.processed_nonces.lock().await;
                             if !seen.insert(frame.nonce) {
                                 debug!(
-                                    "processing broadcast {} (ignored: processed)",
-                                    hex::encode(frame.nonce)
+                                    "broadcast IGNORED: nonce={} ttl={} reason=already processed",
+                                    hex::encode(frame.nonce),
+                                    frame.n
                                 );
                                 return Ok(());
                             }
                         }
 
-                        match String::from_utf8(payload.to_vec()) {
-                            Ok(s) => {
+                        // Read 2-byte length prefix (big-endian)
+                        if payload.len() < 2 {
+                            println!(
+                                "broadcast from {:x?} (ttl={}): [ERROR] payload too short for length prefix",
+                                hex::encode(&frame.src[..8]),
+                                frame.n
+                            );
+                        } else {
+                            let msg_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+                            if payload.len() < 2 + msg_len {
                                 println!(
-                                    "broadcast from {:x?} (ttl={}): \"{}\"",
+                                    "broadcast from {:x?} (ttl={}): [ERROR] payload too short for message",
                                     hex::encode(&frame.src[..8]),
-                                    frame.n,
-                                    s
+                                    frame.n
                                 );
-                            }
-                            Err(_) => {
-                                println!(
-                                    "broadcast from {:x?} (ttl={}): {:?} bytes",
-                                    hex::encode(&frame.src[..8]),
-                                    frame.n,
-                                    payload.len()
-                                );
+                            } else {
+                                let msg_bytes = &payload[2..2 + msg_len];
+                                match String::from_utf8(msg_bytes.to_vec()) {
+                                    Ok(s) => println!(
+                                        "broadcast from {:x?} (ttl={}): \"{}\" ({} bytes)",
+                                        hex::encode(&frame.src[..8]),
+                                        frame.n,
+                                        s,
+                                        msg_len
+                                    ),
+                                    Err(_) => println!(
+                                        "broadcast from {:x?} (ttl={}): [HEX] {} ({} bytes)",
+                                        hex::encode(&frame.src[..8]),
+                                        frame.n,
+                                        hex::encode(msg_bytes),
+                                        msg_len
+                                    ),
+                                }
                             }
                         }
 
@@ -637,6 +664,10 @@ impl Node {
 
                             let map = self.clients.lock().await;
                             for (addr, client_arc) in map.iter() {
+                                // Do not relay back to the origin peer
+                                if *addr == client_addr {
+                                    continue;
+                                }
                                 let mut client = client_arc.lock().await;
                                 client.conn.set_encrypted(false);
                                 client.conn.set_signed(true);
